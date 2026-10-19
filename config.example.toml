@@ -1,0 +1,60 @@
+# snell-xboard-node configuration.
+#
+# Standalone mode (no panel): users come from the local admin API and this file.
+# Panel mode: the panel is the user source; the admin API remains available.
+
+[node]
+# Snell v6 listener. The client's Snell server line points here.
+listen = "0.0.0.0:6160"
+# Pre-shared key every client must know. 12..=255 bytes.
+psk = "change-me-to-a-long-random-psk"
+# v6 record mode: "default", "unshaped" or "unsafe-raw".
+# "default" is the shaped mode Surge 6.x uses by default.
+mode = "default"
+
+# Optional local users (standalone mode). The Snell user key is the uuid;
+# clients configure it as `userkey`.
+# [[node.users]]
+# id = 1
+# uuid = "6f1f8a1e-0000-0000-0000-000000000001"
+# speed_limit = 100          # Mbps, 0 = unlimited
+# device_limit = 3           # distinct source IPs, 0 = unlimited
+# transfer_enable = 0        # bytes, 0 = unlimited
+# expired_at = 0             # unix timestamp, 0 = never
+# enabled = true
+
+[panel]
+# Comment out the whole [panel] table to run standalone.
+url = "https://panel.example.com"
+# Node token created in the panel (server_token, or the machine token).
+token = "panel-token"
+node_id = 1
+# 2 = /api/v2/server/*, 1 = legacy /api/v1/server/UniProxy/*.
+api_version = 2
+pull_interval = 60
+push_interval = 60
+# Optional: set by hand if the panel's handshake reports a WebSocket URL.
+# ws_url = "wss://panel.example.com/ws"
+# machine_id = 1            # machine mode: authenticates as a machine
+
+[admin]
+listen = "127.0.0.1:6161"
+# Bearer token for the admin API. Empty disables authentication.
+token = ""
+# disabled = true            # turn the admin API off entirely
+
+[limits]
+# Seconds a source IP keeps counting toward the device limit after its last
+# connection closes.
+device_ttl = 300
+# Refuse new connections for users whose traffic allowance is used up.
+enforce_quota = true
+# Extra bytes tolerated past the quota.
+quota_grace = 0
+
+[storage]
+# SQLite file holding users and cumulative traffic counters.
+path = "snell-xboard-node.db"
+
+[log]
+level = "info"

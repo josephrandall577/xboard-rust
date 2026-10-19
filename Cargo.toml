@@ -1,0 +1,42 @@
+[package]
+name = "snell-xboard-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Xboard-compatible Snell v6 node backend built on the sing-snell Rust library"
+publish = false
+
+[[bin]]
+name = "snell-xboard-node"
+path = "src/main.rs"
+
+[dependencies]
+snell = { package = "sing-snell", path = "snell" }
+argon2 = "0.6.0"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+socket2 = "0.6.5"
+tokio = { version = "1.53.2", features = ["net", "io-util", "rt-multi-thread", "signal", "sync", "time", "macros"] }
+tokio-util = "0.7.20"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots", "url"] }
+futures-util = { version = "0.3", features = ["sink"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tempfile = "3"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+tower = "0.5.3"
+tokio-util = "0.7.20"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

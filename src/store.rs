@@ -1,0 +1,343 @@
+//! SQLite-backed user and traffic store.
+//!
+//! The store is the single source of truth for the node: the Snell v6 user
+//! map, the admin API and the panel sync all read and write through it.
+//! Traffic counters are aggregated into the database on a timer, not on
+//! every packet, so the hot path only touches atomics.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use tracing::{info, warn};
+
+use crate::config::{User, UserSpec};
+
+#[derive(Debug)]
+pub enum StoreError {
+    Sqlite(rusqlite::Error),
+    DuplicateUuid(String),
+    Invalid(String),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Sqlite(err) => write!(f, "sqlite: {err}"),
+            StoreError::DuplicateUuid(uuid) => write!(f, "duplicate user uuid: {uuid}"),
+            StoreError::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(err: rusqlite::Error) -> Self {
+        StoreError::Sqlite(err)
+    }
+}
+
+/// Thread-safe handle to the user database.
+#[derive(Clone)]
+pub struct Store {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Store {
+    pub fn open(path: impl AsRef<Path>) -> Result<Store, StoreError> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                uuid TEXT NOT NULL UNIQUE,
+                speed_limit INTEGER NOT NULL DEFAULT 0,
+                device_limit INTEGER NOT NULL DEFAULT 0,
+                transfer_enable INTEGER NOT NULL DEFAULT 0,
+                expired_at INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                upload INTEGER NOT NULL DEFAULT 0,
+                download INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )?;
+        Ok(Store { conn: Arc::new(Mutex::new(conn)) })
+    }
+
+    pub fn open_memory() -> Result<Store, StoreError> {
+        Store::open(":memory:")
+    }
+
+    fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, StoreError>) -> Result<T, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        f(&mut conn)
+    }
+
+    pub fn list_users(&self) -> Result<Vec<User>, StoreError> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download
+                 FROM users ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], row_to_user)?;
+            let mut users = Vec::new();
+            for row in rows {
+                users.push(row?);
+            }
+            Ok(users)
+        })
+    }
+
+    pub fn get_user(&self, id: i64) -> Result<Option<User>, StoreError> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download
+                 FROM users WHERE id = ?1",
+                [id],
+                row_to_user,
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+    }
+
+    /// Replaces the full user set, preserving traffic counters for users
+    /// that already exist. This is what the panel user sync uses.
+    pub fn replace_users(&self, specs: &[UserSpec]) -> Result<(), StoreError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            let existing = {
+                let mut stmt = tx.prepare("SELECT id, uuid, upload, download FROM users")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+                })?;
+                let mut map = HashMap::new();
+                for row in rows {
+                    let (id, uuid, upload, download) = row?;
+                    map.insert(uuid, (id, upload, download));
+                }
+                map
+            };
+            tx.execute("DELETE FROM users", [])?;
+            for spec in specs {
+                let (upload, download) = existing
+                    .get(&spec.uuid)
+                    .map(|(_, up, down)| (*up, *down))
+                    .unwrap_or((0, 0));
+                tx.execute(
+                    "INSERT INTO users (id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        spec.id,
+                        spec.uuid,
+                        spec.speed_limit as i64,
+                        spec.device_limit as i64,
+                        spec.transfer_enable as i64,
+                        spec.expired_at,
+                        spec.enabled as i64,
+                        upload,
+                        download
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn upsert_user(&self, spec: &UserSpec) -> Result<User, StoreError> {
+        if spec.uuid.is_empty() || spec.uuid.len() > 255 {
+            return Err(StoreError::Invalid("user uuid must be 1..=255 bytes".into()));
+        }
+        self.with_conn(|conn| {
+            let duplicate: Option<i64> = conn
+                .query_row("SELECT id FROM users WHERE uuid = ?1 AND id != ?2", params![spec.uuid, spec.id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if duplicate.is_some() {
+                return Err(StoreError::DuplicateUuid(spec.uuid.clone()));
+            }
+            let existing: Option<(i64, i64)> = conn
+                .query_row("SELECT upload, download FROM users WHERE id = ?1", [spec.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()?;
+            let (upload, download) = existing.unwrap_or((0, 0));
+            conn.execute(
+                "INSERT INTO users (id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    uuid = excluded.uuid,
+                    speed_limit = excluded.speed_limit,
+                    device_limit = excluded.device_limit,
+                    transfer_enable = excluded.transfer_enable,
+                    expired_at = excluded.expired_at,
+                    enabled = excluded.enabled",
+                params![
+                    spec.id,
+                    spec.uuid,
+                    spec.speed_limit as i64,
+                    spec.device_limit as i64,
+                    spec.transfer_enable as i64,
+                    spec.expired_at,
+                    spec.enabled as i64,
+                    upload,
+                    download
+                ],
+            )?;
+            conn.query_row(
+                "SELECT id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download
+                 FROM users WHERE id = ?1",
+                [spec.id],
+                row_to_user,
+            )
+            .map_err(StoreError::from)
+        })
+    }
+
+    pub fn delete_user(&self, id: i64) -> Result<bool, StoreError> {
+        self.with_conn(|conn| Ok(conn.execute("DELETE FROM users WHERE id = ?1", [id])? > 0))
+    }
+
+    /// Adds traffic deltas to the stored counters.
+    pub fn add_traffic(&self, deltas: &[(i64, crate::config::Traffic)]) -> Result<(), StoreError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt =
+                    tx.prepare("UPDATE users SET upload = upload + ?2, download = download + ?3 WHERE id = ?1")?;
+                for (id, traffic) in deltas {
+                    stmt.execute(params![id, traffic.upload as i64, traffic.download as i64])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn reset_traffic(&self, id: Option<i64>) -> Result<usize, StoreError> {
+        self.with_conn(|conn| match id {
+            Some(id) => Ok(conn.execute("UPDATE users SET upload = 0, download = 0 WHERE id = ?1", [id])?),
+            None => Ok(conn.execute("UPDATE users SET upload = 0, download = 0", [])?),
+        })
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+                .optional()
+                .map_err(StoreError::from)
+        })
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Loads and applies the initial local user set from the configuration.
+    /// Existing users with the same uuid keep their traffic counters.
+    pub fn seed_from_config(&self, specs: &[UserSpec]) -> Result<(), StoreError> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+        // Seed entry by entry so one malformed entry cannot abort startup
+        // or discard the valid ones.
+        let existing = self.list_users()?;
+        if existing.is_empty() {
+            info!(users = specs.len(), "seeding local users from configuration");
+        }
+        for spec in specs {
+            match self.upsert_user(spec) {
+                Ok(_) => {}
+                Err(err) => warn!(user = spec.id, error = %err, "failed to seed local user"),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        id: row.get(0)?,
+        uuid: row.get(1)?,
+        speed_limit: row.get::<_, i64>(2)?.max(0) as u64,
+        device_limit: row.get::<_, i64>(3)?.max(0) as u32,
+        transfer_enable: row.get::<_, i64>(4)?.max(0) as u64,
+        expired_at: row.get(5)?,
+        enabled: row.get::<_, i64>(6)? != 0,
+        upload: row.get::<_, i64>(7)?.max(0) as u64,
+        download: row.get::<_, i64>(8)?.max(0) as u64,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(id: i64, uuid: &str) -> UserSpec {
+        UserSpec {
+            id,
+            uuid: uuid.into(),
+            speed_limit: 100,
+            device_limit: 2,
+            transfer_enable: 1000,
+            expired_at: 0,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn replace_preserves_counters() {
+        let store = Store::open_memory().unwrap();
+        store.replace_users(&[spec(1, "a"), spec(2, "b")]).unwrap();
+        store.add_traffic(&[(1, crate::config::Traffic { upload: 10, download: 20 })]).unwrap();
+        store.replace_users(&[spec(1, "a"), spec(3, "c")]).unwrap();
+        let users = store.list_users().unwrap();
+        assert_eq!(2, users.len());
+        assert_eq!(30, users.iter().find(|u| u.id == 1).unwrap().used());
+        assert_eq!(0, users.iter().find(|u| u.id == 3).unwrap().used());
+    }
+
+    #[test]
+    fn duplicate_uuid_rejected() {
+        let store = Store::open_memory().unwrap();
+        store.upsert_user(&spec(1, "a")).unwrap();
+        let err = store.upsert_user(&spec(2, "a")).unwrap_err();
+        assert!(matches!(err, StoreError::DuplicateUuid(_)));
+    }
+
+    #[test]
+    fn reset_traffic_single_and_all() {
+        let store = Store::open_memory().unwrap();
+        store.replace_users(&[spec(1, "a"), spec(2, "b")]).unwrap();
+        store
+            .add_traffic(&[
+                (1, crate::config::Traffic { upload: 5, download: 5 }),
+                (2, crate::config::Traffic { upload: 7, download: 7 }),
+            ])
+            .unwrap();
+        store.reset_traffic(Some(1)).unwrap();
+        let users = store.list_users().unwrap();
+        assert_eq!(0, users[0].used());
+        assert_eq!(14, users[1].used());
+        store.reset_traffic(None).unwrap();
+        assert!(store.list_users().unwrap().iter().all(|u| u.used() == 0));
+    }
+}

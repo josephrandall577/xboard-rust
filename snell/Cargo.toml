@@ -1,0 +1,28 @@
+[package]
+name = "sing-snell"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Surge snell implemented in Rust"
+repository = "https://github.com/SagerNet/sing-snell"
+readme = "README.md"
+
+[lib]
+name = "snell"
+
+[dependencies]
+argon2 = "0.6.0"
+async-trait = "0.1.92"
+base64 = "0.23.1"
+blake2 = "0.11.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+rand = "0.10.3"
+ring = "0.17"
+socket2 = "0.6.5"
+tokio = { version = "1.53.2", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio-util = "0.7.20"
+
+[dev-dependencies]
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["full"] }
