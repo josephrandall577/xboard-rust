@@ -8,8 +8,8 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::json;
-use snell_xboard_node::store::Store;
-use snell_xboard_node::ws;
+use xboard_snell::store::Store;
+use xboard_snell::ws;
 
 #[derive(Clone, Default)]
 struct Params {

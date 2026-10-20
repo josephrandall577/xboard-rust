@@ -1,5 +1,5 @@
 use snell::{Buffer, Conn, PacketConn, TcpConn, v6};
-use snell_xboard_node::{
+use xboard_snell::{
     config::{Config, NodeConfig, StorageConfig, UserSpec},
     node::Node,
 };
@@ -31,7 +31,7 @@ async fn start(speed: u64, mode: &str) -> (Arc<Node>, tempfile::TempDir, String)
             }],
         },
         panel: None,
-        admin: snell_xboard_node::config::AdminConfig {
+        admin: xboard_snell::config::AdminConfig {
             disabled: true,
             ..Default::default()
         },
@@ -40,6 +40,7 @@ async fn start(speed: u64, mode: &str) -> (Arc<Node>, tempfile::TempDir, String)
             path: temp.path().join("db.sqlite").to_str().unwrap().into(),
         },
         log: Default::default(),
+        nodes: Vec::new(),
     };
     let node = Node::start(config).await.unwrap();
     let addr = node

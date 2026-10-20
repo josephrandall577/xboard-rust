@@ -1,16 +1,16 @@
-//! `snell-xboard-node`: an Xboard-compatible Snell v6 landing server.
+//! `xboard-snell`: an Xboard-compatible Snell v6 landing server.
 //!
 //! ```text
-//! snell-xboard-node -c config.toml
+//! xboard-snell -c config.toml
 //! ```
 
 use clap::Parser;
-use snell_xboard_node::config;
-use snell_xboard_node::node;
 use tracing_subscriber::EnvFilter;
+use xboard_snell::config;
+use xboard_snell::node;
 
 #[derive(Parser, Debug)]
-#[command(name = "snell-xboard-node", version, about = "Xboard-compatible Snell v6 node backend")]
+#[command(name = "xboard-snell", version, about = "Xboard-compatible Snell v6 node backend")]
 struct Args {
     /// Path to the TOML configuration file.
     #[arg(short, long, env = "SNELL_XBOARD_CONFIG", default_value = "config.toml")]
@@ -41,15 +41,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     node::mark_start();
-    let node = node::Node::start(config).await?;
-    tracing::info!(
-        listen = %node.config.node.listen,
-        database = %node.config.storage.path,
-        mode = %node.config.node.mode,
-        panel = node.panel.is_some(),
-        "snell-xboard-node started"
-    );
-    node.wait_for_signal().await;
-    node.shutdown().await;
+    let nodes = node::Node::start_many(config).await?;
+    for node in &nodes {
+        tracing::info!(
+            name = %node.name,
+            listen = %node.config.node.listen,
+            database = %node.config.storage.path,
+            mode = %node.config.node.mode,
+            panel = node.panel.is_some(),
+            "xboard-snell node started"
+        );
+    }
+    if let Some(node) = nodes.first() {
+        node.wait_for_signal().await;
+    }
+    for node in &nodes {
+        node.shutdown().await;
+    }
     Ok(())
 }

@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use snell::v6::{self, Client, ClientOptions};
 use snell::{Buffer, Conn, PacketConn, Socksaddr, TcpConn};
-use snell_xboard_node::config::{Config, NodeConfig, UserSpec};
-use snell_xboard_node::node::Node;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use xboard_snell::config::{AdminConfig, Config, ManagedNodeConfig, NodeConfig, PanelConfig, UserSpec};
+use xboard_snell::node::Node;
 
 const PSK: &str = "integration-test-psk-0123456789";
 const MODES: [&str; 3] = ["default", "unshaped", "unsafe-raw"];
@@ -28,10 +28,11 @@ impl Harness {
         let config = Config {
             node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: mode.into(), users },
             panel: None,
-            admin: snell_xboard_node::config::AdminConfig { disabled: true, ..Default::default() },
+            admin: xboard_snell::config::AdminConfig { disabled: true, ..Default::default() },
             limits: Default::default(),
-            storage: snell_xboard_node::config::StorageConfig { path: db.to_string_lossy().into_owned() },
+            storage: xboard_snell::config::StorageConfig { path: db.to_string_lossy().into_owned() },
             log: Default::default(),
+            nodes: Vec::new(),
         };
         let node = Node::start(config).await.unwrap();
         let server = node.server.read().await.clone().unwrap();
@@ -202,7 +203,7 @@ async fn device_limit_refuses_extra_source_ips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_user_is_refused() {
     let mut user = spec(1, "alice-key");
-    user.expired_at = snell_xboard_node::config::unix_now() - 1;
+    user.expired_at = xboard_snell::config::unix_now() - 1;
     let harness = Harness::start("unshaped", vec![user]).await;
     let client = harness.client("alice-key");
     let result = round_trip(&client, &harness.address, b"expired").await;
@@ -216,7 +217,7 @@ async fn quota_exhausted_user_is_refused() {
     user.transfer_enable = 1;
     let harness = Harness::start("unshaped", vec![user]).await;
     // Mark the quota as fully used before the connection is attempted.
-    harness.node.store.add_traffic(&[(1, snell_xboard_node::config::Traffic { upload: 1, download: 0 })]).unwrap();
+    harness.node.store.add_traffic(&[(1, xboard_snell::config::Traffic { upload: 1, download: 0 })]).unwrap();
     harness.node.registry.apply_users(&harness.node.store.list_users().unwrap());
     let client = harness.client("alice-key");
     let result = round_trip(&client, &harness.address, b"over quota").await;
@@ -322,5 +323,124 @@ async fn limited_udp_preserves_complete_datagrams() {
         assert_eq!(12288, totals.upload, "mode {mode} UDP upload accounting");
         assert_eq!(12288, totals.download, "mode {mode} UDP download accounting");
         harness.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
+    use std::net::IpAddr;
+    let temp = tempfile::tempdir().unwrap();
+    let make_node = |name: &str, ip: &str, psk: &str, node_id| ManagedNodeConfig {
+        name: name.into(),
+        listen: if ip.contains(":") { format!("[{ip}]:0") } else { format!("{ip}:0") },
+        psk: psk.into(),
+        mode: "unshaped".into(),
+        panel: PanelConfig {
+            url: "http://127.0.0.1:9".into(),
+            token: format!("panel-{name}"),
+            node_id,
+            pull_interval: 3600,
+            push_interval: 3600,
+            api_version: 2,
+            ws_url: None,
+            machine_id: None,
+        },
+        admin: AdminConfig { disabled: true, ..Default::default() },
+    };
+    let config = Config {
+        node: NodeConfig::default(),
+        panel: None,
+        admin: AdminConfig::default(),
+        limits: Default::default(),
+        storage: xboard_snell::config::StorageConfig {
+            path: temp.path().join("shared.db").to_string_lossy().into_owned(),
+        },
+        log: Default::default(),
+        nodes: vec![
+            make_node("a", "127.0.0.1", "managed-node-psk-a-001", 1),
+            make_node("b", "::1", "managed-node-psk-b-002", 2),
+        ],
+    };
+    let nodes = Node::start_many(config).await.unwrap();
+    assert_eq!(2, nodes.len());
+    let payloads = [b"node-a-payload".to_vec(), b"node-b-payload".to_vec()];
+    for (index, ((node, expected_ip), psk)) in
+        nodes.iter().zip(["127.0.0.1", "::1"]).zip(["managed-node-psk-a-001", "managed-node-psk-b-002"]).enumerate()
+    {
+        let key = format!("key-{}", node.name);
+        let user = xboard_snell::config::User {
+            id: 7,
+            uuid: key.clone(),
+            speed_limit: 0,
+            device_limit: 0,
+            transfer_enable: 0,
+            expired_at: 0,
+            enabled: true,
+            upload: 0,
+            download: 0,
+        };
+        node.registry.apply_users(std::slice::from_ref(&user));
+        node.server.read().await.as_ref().unwrap().update_users(&[user]).unwrap();
+        let listen_ip = expected_ip.parse::<IpAddr>().unwrap();
+        let listener = TcpListener::bind(std::net::SocketAddr::new(listen_ip, 0)).await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let tcp_target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let source = stream.peer_addr().unwrap().ip();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            (source, received)
+        });
+        let server_addr = node.server.read().await.as_ref().unwrap().local_addr();
+        let client = Client::new(ClientOptions {
+            psk: psk.as_bytes().to_vec(),
+            user_key: key.as_bytes().to_vec(),
+            mode: v6::Mode::Unshaped,
+            server: Socksaddr::from(server_addr),
+            ..Default::default()
+        })
+        .unwrap();
+        let proxy = client.dial_conn(dial(&server_addr.to_string()).await, tcp_addr.into()).await.unwrap();
+        proxy.write(&payloads[index]).await.unwrap();
+        proxy.close_write().await.unwrap();
+        let (tcp_source, received) = tokio::time::timeout(Duration::from_secs(5), tcp_target).await.unwrap().unwrap();
+        assert_eq!(expected_ip.parse::<IpAddr>().unwrap(), tcp_source, "node {} TCP egress IP", node.name);
+        assert_eq!(payloads[index], received, "node {} TCP payload", node.name);
+        let _ = proxy.close().await;
+
+        let udp_target = UdpSocket::bind(std::net::SocketAddr::new(listen_ip, 0)).await.unwrap();
+        let udp_addr = udp_target.local_addr().unwrap();
+        let udp_server = tokio::spawn(async move {
+            let mut buffer = vec![0; 65536];
+            let (length, source) =
+                tokio::time::timeout(Duration::from_secs(5), udp_target.recv_from(&mut buffer)).await.unwrap().unwrap();
+            let received = buffer[..length].to_vec();
+            udp_target.send_to(&received, source).await.unwrap();
+            (source.ip(), received)
+        });
+        let packet_conn = client.dial_packet_conn(dial(&server_addr.to_string()).await).unwrap();
+        packet_conn.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(5))).unwrap();
+        let packet = Buffer::from_slice_with_headroom(
+            &payloads[index],
+            packet_conn.front_headroom(),
+            packet_conn.rear_headroom(),
+        );
+        packet_conn.write_packet(packet, Socksaddr::from(udp_addr)).await.unwrap();
+        let mut reply = Buffer::new_packet();
+        let reply_source = packet_conn.read_packet(&mut reply).await.unwrap();
+        let (udp_source, sent) = udp_server.await.unwrap();
+        assert_eq!(expected_ip.parse::<IpAddr>().unwrap(), udp_source, "node {} UDP egress IP", node.name);
+        assert_eq!(payloads[index], sent, "node {} UDP payload", node.name);
+        assert_eq!(payloads[index], reply.into_vec(), "node {} UDP reply", node.name);
+        assert_eq!(Socksaddr::from(udp_addr), reply_source);
+        let totals = node.registry.state(7).unwrap().totals();
+        assert_eq!(2 * payloads[index].len() as u64, totals.upload);
+        assert_eq!(payloads[index].len() as u64, totals.download);
+        let _ = packet_conn.close().await;
+    }
+    assert_ne!(nodes[0].config.storage.path, nodes[1].config.storage.path);
+    assert_ne!(nodes[0].registry.spec(7).unwrap().uuid, nodes[1].registry.spec(7).unwrap().uuid);
+    for node in &nodes {
+        node.shutdown().await;
     }
 }

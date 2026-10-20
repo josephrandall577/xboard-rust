@@ -1,0 +1,53 @@
+# One process, independently accounted Xboard nodes.
+# Every listen IP must already be assigned to this host and unique across nodes.
+# TCP and UDP destination sockets use the matching node listen IP as their source.
+
+[[nodes]]
+name = "edge-a"
+listen = "192.0.2.10:6160"
+psk = "replace-with-a-unique-16-byte-key-a"
+mode = "default"
+
+[nodes.panel]
+url = "https://panel.example.com"
+token = "replace-with-node-a-token"
+node_id = 1
+api_version = 2
+pull_interval = 60
+push_interval = 60
+
+[nodes.admin]
+listen = "127.0.0.1:6161"
+token = "replace-with-node-a-admin-token"
+disabled = false
+
+[[nodes]]
+name = "edge-b"
+listen = "192.0.2.11:6160"
+psk = "replace-with-a-unique-16-byte-key-b"
+mode = "default"
+
+[nodes.panel]
+url = "https://panel.example.com"
+token = "replace-with-node-b-token"
+node_id = 2
+api_version = 2
+pull_interval = 60
+push_interval = 60
+
+[nodes.admin]
+listen = "127.0.0.1:6162"
+token = "replace-with-node-b-admin-token"
+disabled = false
+
+[limits]
+device_ttl = 300
+enforce_quota = true
+quota_grace = 0
+
+[storage]
+# Each node gets its own file: xboard-snell-edge-a.db and xboard-snell-edge-b.db.
+path = "xboard-snell.db"
+
+[log]
+level = "info"

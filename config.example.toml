@@ -1,4 +1,4 @@
-# snell-xboard-node configuration.
+# xboard-snell configuration.
 #
 # Standalone mode (no panel): users come from the local admin API and this file.
 # Panel mode: the panel is the user source; the admin API remains available.
@@ -54,7 +54,11 @@ quota_grace = 0
 
 [storage]
 # SQLite file holding users and cumulative traffic counters.
-path = "snell-xboard-node.db"
+path = "xboard-snell.db"
 
 [log]
 level = "info"
+
+# Multi-panel mode uses one process for independent nodes. Copy this file to a
+# separate config and remove the legacy [node] and [panel] sections first.
+# See config.multi-node.example.toml for a complete working-shape example.

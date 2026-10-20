@@ -62,7 +62,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --locked --target "$TARGET" --bin snell-xboard-node
+        run: cargo build --release --locked --target "$TARGET" --bin xboard-snell
       - name: Package and smoke-test extracted binary
         run: python scripts/package_release.py --target "$TARGET" --version "$VERSION" --output dist
       - name: Upload build artifacts

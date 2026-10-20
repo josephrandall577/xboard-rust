@@ -12,8 +12,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use snell_xboard_node::config::{PanelConfig, Traffic};
-use snell_xboard_node::panel::{PanelClient, SystemStatus, build_metrics};
+use xboard_snell::config::{PanelConfig, Traffic};
+use xboard_snell::panel::{PanelClient, SystemStatus, build_metrics};
 
 #[derive(Clone, Default)]
 struct Recorded {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use snell::{Buffer, CloseHandler, Conn, Context, Handler, PacketConn, Socksaddr, TcpConn};
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket, lookup_host};
 use tracing::debug;
 
 use crate::accounting::{Counters, Registry, UserState};
@@ -30,6 +30,8 @@ pub struct RelayHandler {
     /// Whether to enforce quotas (close connections whose user ran out).
     pub enforce_quota: bool,
     pub quota_grace: u64,
+    /// When set, all destination sockets bind to this listener's local IP.
+    pub outbound: Option<SocketAddr>,
 }
 
 impl RelayHandler {
@@ -74,8 +76,9 @@ impl Handler for RelayHandler {
         self.counters.connection_opened();
         let registry = self.registry.clone();
         let counters = self.counters.clone();
+        let outbound = self.outbound;
         tokio::spawn(async move {
-            let result = relay_tcp(conn.clone(), destination.clone(), state).await;
+            let result = relay_tcp(conn.clone(), destination.clone(), state, outbound).await;
             if let Err(err) = &result {
                 debug!(user = user.id, destination = %destination, error = %err, "tcp relay ended with error");
             }
@@ -102,8 +105,9 @@ impl Handler for RelayHandler {
         self.counters.connection_opened();
         let registry = self.registry.clone();
         let counters = self.counters.clone();
+        let outbound = self.outbound;
         tokio::spawn(async move {
-            let result = relay_udp(conn.clone(), state).await;
+            let result = relay_udp(conn.clone(), state, outbound).await;
             if let Err(err) = &result {
                 debug!(user = user.id, error = %err, "udp relay ended with error");
             }
@@ -134,8 +138,13 @@ fn close_packet_refused(conn: Arc<dyn PacketConn>, on_close: Option<CloseHandler
     });
 }
 
-async fn relay_tcp(client: Arc<dyn Conn>, destination: Socksaddr, state: Arc<UserState>) -> io::Result<()> {
-    let upstream = connect_tcp(&destination).await?;
+async fn relay_tcp(
+    client: Arc<dyn Conn>,
+    destination: Socksaddr,
+    state: Arc<UserState>,
+    outbound: Option<SocketAddr>,
+) -> io::Result<()> {
+    let upstream = connect_tcp(&destination, outbound).await?;
     let upload = {
         let (client, upstream, state) = (client.clone(), upstream.clone(), state.clone());
         async move {
@@ -199,21 +208,52 @@ async fn copy_metered(
     }
 }
 
-async fn connect_tcp(destination: &Socksaddr) -> io::Result<Arc<dyn Conn>> {
-    let stream = match destination.socket_addr() {
-        Some(addr) => TcpStream::connect(addr).await?,
-        None => TcpStream::connect((destination.host()?.as_ref(), destination.port)).await?,
+async fn connect_tcp(destination: &Socksaddr, outbound: Option<SocketAddr>) -> io::Result<Arc<dyn Conn>> {
+    let stream = match outbound {
+        None => match destination.socket_addr() {
+            Some(addr) => TcpStream::connect(addr).await?,
+            None => TcpStream::connect((destination.host()?.as_ref(), destination.port)).await?,
+        },
+        Some(local_addr) => {
+            let remote = resolve_destination(destination, local_addr.is_ipv4()).await?;
+            let socket = if local_addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+            socket.bind(with_zero_port(local_addr))?;
+            socket.connect(remote).await?
+        }
     };
     let conn = TcpConn::new(stream)?;
     Ok(Arc::new(conn))
 }
 
+fn with_zero_port(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(address) => SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), 0)),
+        SocketAddr::V6(address) => {
+            SocketAddr::V6(std::net::SocketAddrV6::new(*address.ip(), 0, address.flowinfo(), address.scope_id()))
+        }
+    }
+}
+
+async fn resolve_destination(destination: &Socksaddr, ipv4: bool) -> io::Result<SocketAddr> {
+    if let Some(addr) = destination.socket_addr() {
+        return if addr.is_ipv4() == ipv4 {
+            Ok(addr)
+        } else {
+            Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "destination and node IP address families differ"))
+        };
+    }
+    lookup_host((destination.host()?.as_ref(), destination.port)).await?.find(|addr| addr.is_ipv4() == ipv4).ok_or_else(
+        || io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS returned no address matching the node IP family"),
+    )
+}
+
 /// UDP relay with a single association socket.
-async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>) -> io::Result<()> {
+async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>, outbound: Option<SocketAddr>) -> io::Result<()> {
     // Use an unconnected socket and track the last destination. Snell UDP
     // tunnels are request/response pairs in practice; replies from any of
     // the destinations in the tunnel are forwarded back to the client.
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let bind_address = outbound.map(with_zero_port).unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
+    let socket = Arc::new(UdpSocket::bind(bind_address).await?);
     let downlink = {
         let socket = socket.clone();
         let conn = conn.clone();
@@ -238,7 +278,7 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>) -> io::Resu
         loop {
             let mut buffer = Buffer::new_packet();
             let destination = conn.read_packet(&mut buffer).await?;
-            let Some(addr) = resolve_udp(&destination).await else {
+            let Some(addr) = resolve_udp(&destination, outbound).await else {
                 continue;
             };
             let bytes = buffer.bytes();
@@ -254,14 +294,14 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>) -> io::Resu
     result
 }
 
-async fn resolve_udp(destination: &Socksaddr) -> Option<SocketAddr> {
+async fn resolve_udp(destination: &Socksaddr, outbound: Option<SocketAddr>) -> Option<SocketAddr> {
+    let ipv4 = outbound.map(|addr| addr.is_ipv4());
     if let Some(addr) = destination.socket_addr() {
-        return Some(addr);
+        return ipv4.is_none_or(|family| addr.is_ipv4() == family).then_some(addr);
     }
-    match tokio::time::timeout(UDP_READ_TIMEOUT, lookup_host((destination.host().ok()?.as_ref(), destination.port)))
-        .await
-    {
-        Ok(Ok(mut addresses)) => addresses.next(),
+    let host = destination.host().ok()?;
+    match tokio::time::timeout(UDP_READ_TIMEOUT, lookup_host((host.as_ref(), destination.port))).await {
+        Ok(Ok(mut addresses)) => addresses.find(|addr| ipv4.is_none_or(|family| addr.is_ipv4() == family)),
         _ => None,
     }
 }
@@ -299,7 +339,8 @@ mod tests {
     #[test]
     fn authorize_requires_authenticated_user() {
         let (registry, counters) = registry_with_user();
-        let handler = RelayHandler { registry: registry.clone(), counters, enforce_quota: true, quota_grace: 0 };
+        let handler =
+            RelayHandler { registry: registry.clone(), counters, enforce_quota: true, quota_grace: 0, outbound: None };
         let ctx = Context::new();
         assert!(handler.authorize(&ctx, &Socksaddr::parse_host_port("1.2.3.4", 1000)).is_none());
         let user = handler.registry.spec(7).unwrap();
@@ -321,7 +362,7 @@ mod tests {
             upload: 100,
             download: 0,
         }]);
-        let handler = RelayHandler { registry, counters, enforce_quota: true, quota_grace: 0 };
+        let handler = RelayHandler { registry, counters, enforce_quota: true, quota_grace: 0, outbound: None };
         let user = handler.registry.spec(7).unwrap();
         let ctx = Context::new().with_user(entry(user));
         assert!(handler.authorize(&ctx, &Socksaddr::parse_host_port("1.2.3.4", 1)).is_none());

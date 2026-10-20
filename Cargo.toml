@@ -1,14 +1,14 @@
 [package]
-name = "snell-xboard-node"
-version = "1.0.0"
+name = "xboard-snell"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
-description = "Xboard-compatible Snell v6 node backend built on the sing-snell Rust library"
+description = "Xboard-compatible Snell v6 server with per-node IP isolation and per-user accounting"
 publish = false
 
 [[bin]]
-name = "snell-xboard-node"
+name = "xboard-snell"
 path = "src/main.rs"
 
 [dependencies]

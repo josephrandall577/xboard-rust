@@ -99,7 +99,7 @@ impl PanelClient {
     pub fn new(config: PanelConfig) -> Result<PanelClient, PanelError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("snell-xboard-node/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("xboard-snell/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let base = config.url.trim_end_matches('/').to_string();
         Ok(PanelClient { config, http, base })

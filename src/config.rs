@@ -183,6 +183,20 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub log: LogConfig,
+    /// Independent panel-backed nodes served by one process.
+    #[serde(default)]
+    pub nodes: Vec<ManagedNodeConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ManagedNodeConfig {
+    pub name: String,
+    pub listen: String,
+    pub psk: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    pub panel: PanelConfig,
+    pub admin: AdminConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -308,8 +322,29 @@ impl Default for StorageConfig {
     }
 }
 
+const LEGACY_DEFAULT_STORAGE_PATH: &str = "snell-xboard-node.db";
+
 fn default_storage_path() -> String {
-    "snell-xboard-node.db".into()
+    "xboard-snell.db".into()
+}
+
+fn storage_path_was_specified(document: &toml::Value) -> bool {
+    document.get("storage").and_then(toml::Value::as_table).is_some_and(|storage| storage.contains_key("path"))
+}
+
+fn preserve_legacy_default_database(
+    storage: &mut StorageConfig,
+    directory: &std::path::Path,
+    storage_path_explicit: bool,
+) {
+    if storage_path_explicit || storage.path != default_storage_path() {
+        return;
+    }
+    let current = directory.join(&storage.path);
+    let legacy = directory.join(LEGACY_DEFAULT_STORAGE_PATH);
+    if !current.exists() && legacy.is_file() {
+        storage.path = LEGACY_DEFAULT_STORAGE_PATH.into();
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -331,19 +366,88 @@ fn default_log_level() -> String {
 impl Config {
     pub fn load(path: &str) -> Result<Config, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|err| ConfigError::Read(path.into(), err))?;
-        let mut config: Config = toml::from_str(&content).map_err(|err| ConfigError::Parse(err.to_string()))?;
+        let document: toml::Value = toml::from_str(&content).map_err(|err| ConfigError::Parse(err.to_string()))?;
+        let storage_path_explicit = storage_path_was_specified(&document);
+        let mut config: Config =
+            document.try_into().map_err(|err: toml::de::Error| ConfigError::Parse(err.to_string()))?;
+        preserve_legacy_default_database(&mut config.storage, std::path::Path::new("."), storage_path_explicit);
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn managed_node_config(&self, node: &ManagedNodeConfig) -> Result<Config, ConfigError> {
+        let mut config = self.clone();
+        config.node = NodeConfig {
+            listen: node.listen.clone(),
+            psk: node.psk.clone(),
+            mode: node.mode.clone(),
+            users: Vec::new(),
+        };
+        config.panel = Some(node.panel.clone());
+        config.admin = node.admin.clone();
+        config.nodes.clear();
+        config.storage.path = managed_storage_path(&self.storage.path, &node.name);
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&mut self) -> Result<(), ConfigError> {
-        let len = self.node.psk.len();
-        if !(12..=255).contains(&len) {
-            return Err(ConfigError::InvalidPsk(len));
+        if !self.nodes.is_empty() {
+            let legacy_node_configured = self.node.listen != default_listen()
+                || self.node.mode != default_mode()
+                || !self.node.psk.is_empty()
+                || !self.node.users.is_empty();
+            let default_admin = AdminConfig::default();
+            let legacy_admin_configured = self.admin.listen != default_admin.listen
+                || self.admin.token != default_admin.token
+                || self.admin.disabled != default_admin.disabled;
+            if self.panel.is_some() || legacy_node_configured || legacy_admin_configured {
+                return Err(ConfigError::MixedNodeConfiguration);
+            }
+            let mut names = std::collections::HashSet::new();
+            let mut ips = std::collections::HashSet::new();
+            let mut listeners = std::collections::HashSet::new();
+            let mut admins = std::collections::HashSet::new();
+            let mut panels = std::collections::HashSet::new();
+            for node in &self.nodes {
+                if node.name.is_empty()
+                    || !node.name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    || !names.insert(node.name.to_ascii_lowercase())
+                {
+                    return Err(ConfigError::InvalidNodeName(node.name.clone()));
+                }
+                let address: std::net::SocketAddr =
+                    node.listen.parse().map_err(|_| ConfigError::InvalidNodeListen(node.name.clone()))?;
+                if address.ip().is_unspecified() || !ips.insert(address.ip()) || !listeners.insert(address) {
+                    return Err(ConfigError::DuplicateNodeIp(node.listen.clone()));
+                }
+                if !node.admin.disabled {
+                    if node.admin.token.is_empty() {
+                        return Err(ConfigError::InvalidAdminToken(node.name.clone()));
+                    }
+                    let admin: std::net::SocketAddr =
+                        node.admin.listen.parse().map_err(|_| ConfigError::InvalidAdminListen(node.name.clone()))?;
+                    if listeners.contains(&admin) || !admins.insert(admin) {
+                        return Err(ConfigError::DuplicateAdminListen(node.admin.listen.clone()));
+                    }
+                }
+                let panel_identity = (
+                    node.panel.url.trim_end_matches('/').to_string(),
+                    node.panel.token.clone(),
+                    node.panel.node_id,
+                    node.panel.machine_id,
+                );
+                if !panels.insert(panel_identity) {
+                    return Err(ConfigError::DuplicatePanelNode(node.name.clone()));
+                }
+                validate_node_credentials(&node.psk, &node.mode)?;
+                if node.panel.url.is_empty() || node.panel.token.is_empty() {
+                    return Err(ConfigError::InvalidPanel(node.name.clone()));
+                }
+            }
+            return Ok(());
         }
-        if snell::v6::parse_mode(&self.node.mode).is_err() {
-            return Err(ConfigError::InvalidMode(self.node.mode.clone()));
-        }
+        validate_node_credentials(&self.node.psk, &self.node.mode)?;
         let mut seen = std::collections::HashSet::new();
         for user in &mut self.node.users {
             if user.uuid.is_empty() || user.uuid.len() > 255 {
@@ -358,6 +462,27 @@ impl Config {
     }
 }
 
+fn managed_storage_path(base: &str, name: &str) -> String {
+    let path = std::path::Path::new(base);
+    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("xboard-snell");
+    let extension = path.extension().and_then(|value| value.to_str());
+    let filename = match extension {
+        Some(extension) => format!("{stem}-{name}.{extension}"),
+        None => format!("{stem}-{name}"),
+    };
+    path.with_file_name(filename).to_string_lossy().into_owned()
+}
+
+fn validate_node_credentials(psk: &str, mode: &str) -> Result<(), ConfigError> {
+    if !(12..=255).contains(&psk.len()) {
+        return Err(ConfigError::InvalidPsk(psk.len()));
+    }
+    if snell::v6::parse_mode(mode).is_err() {
+        return Err(ConfigError::InvalidMode(mode.to_string()));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Read(String, std::io::Error),
@@ -366,6 +491,15 @@ pub enum ConfigError {
     InvalidMode(String),
     InvalidUuid(i64),
     DuplicateUuid(String),
+    MixedNodeConfiguration,
+    InvalidNodeName(String),
+    InvalidNodeListen(String),
+    DuplicateNodeIp(String),
+    DuplicateAdminListen(String),
+    InvalidPanel(String),
+    InvalidAdminListen(String),
+    DuplicatePanelNode(String),
+    InvalidAdminToken(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -379,6 +513,27 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidMode(mode) => write!(f, "unknown snell v6 mode: {mode}"),
             ConfigError::InvalidUuid(id) => write!(f, "user {id}: uuid must be 1..=255 bytes"),
             ConfigError::DuplicateUuid(uuid) => write!(f, "duplicate user uuid: {uuid}"),
+            ConfigError::MixedNodeConfiguration => {
+                write!(f, "managed nodes cannot be combined with legacy node, panel or local users")
+            }
+            ConfigError::InvalidNodeName(name) => write!(f, "invalid or duplicate managed node name: {name}"),
+            ConfigError::InvalidNodeListen(name) => {
+                write!(f, "node {name}: listen must be a literal IP socket address")
+            }
+            ConfigError::DuplicateNodeIp(listen) => {
+                write!(f, "managed nodes require distinct, specific listen IPs: {listen}")
+            }
+            ConfigError::DuplicateAdminListen(listen) => {
+                write!(f, "duplicate managed-node admin listen address: {listen}")
+            }
+            ConfigError::InvalidPanel(name) => write!(f, "managed node {name}: panel url and token are required"),
+            ConfigError::InvalidAdminListen(name) => write!(f, "node {name}: admin listen must be a socket address"),
+            ConfigError::DuplicatePanelNode(name) => {
+                write!(f, "node {name}: another managed node uses the same panel credentials and ID")
+            }
+            ConfigError::InvalidAdminToken(name) => {
+                write!(f, "node {name}: enabled admin API requires a non-empty token")
+            }
         }
     }
 }
@@ -392,6 +547,40 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_legacy_default_database_is_selected_without_overwriting_new_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("snell-xboard-node.db");
+        std::fs::write(&legacy, b"existing database").unwrap();
+        let mut storage = StorageConfig::default();
+        preserve_legacy_default_database(&mut storage, temp.path(), false);
+        assert_eq!("snell-xboard-node.db", storage.path);
+
+        storage.path = default_storage_path();
+        preserve_legacy_default_database(&mut storage, temp.path(), true);
+        assert_eq!("xboard-snell.db", storage.path);
+
+        let current = temp.path().join("xboard-snell.db");
+        std::fs::write(&current, b"new database").unwrap();
+        storage.path = default_storage_path();
+        preserve_legacy_default_database(&mut storage, temp.path(), false);
+        assert_eq!("xboard-snell.db", storage.path);
+
+        storage.path = "custom.db".into();
+        preserve_legacy_default_database(&mut storage, temp.path(), false);
+        assert_eq!("custom.db", storage.path);
+    }
+
+    #[test]
+    fn storage_path_presence_distinguishes_omitted_and_explicit_default() {
+        let omitted: toml::Value = toml::from_str("[node]\npsk = \"123456789012\"\n").unwrap();
+        let table_without_path: toml::Value = toml::from_str("[storage]\n").unwrap();
+        let explicit_default: toml::Value = toml::from_str("[storage]\npath = \"xboard-snell.db\"\n").unwrap();
+        assert!(!storage_path_was_specified(&omitted));
+        assert!(!storage_path_was_specified(&table_without_path));
+        assert!(storage_path_was_specified(&explicit_default));
+    }
 
     #[test]
     fn user_activity_rules() {
@@ -435,6 +624,64 @@ mod tests {
     }
 
     #[test]
+    fn managed_node_example_is_valid_and_uses_separate_databases() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.multi-node.example.toml");
+        let config = Config::load(path).expect("multi-node example must parse and validate");
+        assert_eq!(2, config.nodes.len());
+        let first = config.managed_node_config(&config.nodes[0]).unwrap();
+        let second = config.managed_node_config(&config.nodes[1]).unwrap();
+        assert_ne!(first.storage.path, second.storage.path);
+        assert!(first.storage.path.ends_with("xboard-snell-edge-a.db"));
+        assert_eq!(1, first.panel.unwrap().node_id);
+        assert_eq!(2, second.panel.unwrap().node_id);
+    }
+
+    #[test]
+    fn managed_nodes_reject_wildcard_duplicate_ips_and_admin_endpoints() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.multi-node.example.toml");
+        let mut config = Config::load(path).unwrap();
+        config.nodes[1].listen = "192.0.2.10:6161".into();
+        assert!(matches!(config.validate(), Err(ConfigError::DuplicateNodeIp(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.nodes[0].listen = "0.0.0.0:6160".into();
+        assert!(matches!(config.validate(), Err(ConfigError::DuplicateNodeIp(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.nodes[1].name = "EDGE-A".into();
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidNodeName(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.nodes[1].admin.listen = config.nodes[0].admin.listen.clone();
+        assert!(matches!(config.validate(), Err(ConfigError::DuplicateAdminListen(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.nodes[0].admin.token.clear();
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidAdminToken(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.nodes[1].panel.token = config.nodes[0].panel.token.clone();
+        config.nodes[1].panel.node_id = config.nodes[0].panel.node_id;
+        assert!(matches!(config.validate(), Err(ConfigError::DuplicatePanelNode(_))));
+
+        let mut config = Config::load(path).unwrap();
+        config.node.listen = "127.0.0.1:6160".into();
+        assert!(matches!(config.validate(), Err(ConfigError::MixedNodeConfiguration)));
+
+        let mut config = Config::load(path).unwrap();
+        config.admin.disabled = true;
+        assert!(matches!(config.validate(), Err(ConfigError::MixedNodeConfiguration)));
+
+        let mut config = Config::load(path).unwrap();
+        config.panel = Some(PanelConfig {
+            url: "https://example.com".into(),
+            token: "legacy".into(),
+            ..config.nodes[0].panel.clone()
+        });
+        assert!(matches!(config.validate(), Err(ConfigError::MixedNodeConfiguration)));
+    }
+
+    #[test]
     fn config_rejects_short_psk() {
         let mut config = Config {
             node: NodeConfig { psk: "short".into(), ..Default::default() },
@@ -443,6 +690,7 @@ mod tests {
             limits: Default::default(),
             storage: Default::default(),
             log: Default::default(),
+            nodes: Vec::new(),
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPsk(5))));
         config.node.psk = "0123456789ab".into();

@@ -1,4 +1,4 @@
-# snell-xboard-node
+# xboard-snell
 
 An Xboard-compatible Snell v6 landing server built on the vendored
 [`snell`](snell/) crate (the Rust port of sing-snell).
@@ -42,9 +42,9 @@ A Git tag push alone does not publish binaries.
 | Windows | x86_64 | `x86_64-pc-windows-msvc.zip` |
 | Windows | ARM64 | `aarch64-pc-windows-msvc.zip` |
 
-Assets are named `snell-xboard-node-<release-tag>-<target>.<archive-type>`.
-Each archive contains the executable, `config.example.toml`, this README and
-the license. Linux binaries use static musl and bundled SQLite; Windows
+Assets are named `xboard-snell-<release-tag>-<target>.<archive-type>`.
+Each archive contains the executable, both single-node and multi-node TOML
+examples, this README and the license.
 binaries statically link the MSVC runtime. macOS binaries are unsigned.
 
 Download the matching archive from [Releases](https://github.com/josephrandall577/xboard-snell/releases),
@@ -54,18 +54,37 @@ settings and server PSK. On Linux/macOS:
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
 # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
-./snell-xboard-node --check -c config.toml
-./snell-xboard-node -c config.toml
+./xboard-snell --check -c config.toml
+./xboard-snell -c config.toml
 ```
 
 On Windows, run `Get-FileHash <archive.zip> -Algorithm SHA256` and compare it
-with `SHA256SUMS`, then run `.\snell-xboard-node.exe -c config.toml` in PowerShell.
+with `SHA256SUMS`, then run `.\xboard-snell.exe -c config.toml` in PowerShell.
 
 Maintainers can use **Actions → Release binaries → Run workflow** to verify
 the same build and packaging steps without publishing a Release. Manual runs
 provide Actions artifacts and do not attach files to a Release. CI separately
 runs node/library tests on Linux, macOS and Windows, plus bidirectional Go
 interoperability on Linux.
+
+## Multiple panel nodes
+
+One process can run several independent panel-backed nodes. Define each node in
+[[nodes]] with a unique name and a distinct, specific local IP address (not a
+wildcard); each node also needs its own listening port, PSK, panel node ID and
+unique management API listen address. TCP and UDP destination sockets bind to
+the same local IP as the corresponding Snell listener. If the requested
+address family or local bind is unavailable, the connection fails rather than
+leaving through another node's IP. Users, traffic accounting, SQLite files,
+rate limits, device limits, panel credentials and management tokens are
+independent per node. Shared quota and log settings remain at the top level.
+
+Start from config.multi-node.example.toml; do not combine [[nodes]] with the
+legacy [node] / [panel] configuration. Distinct IPs must already be assigned
+to this host. Management API endpoints are configured per node. When upgrading
+an installation whose config omits [storage], an existing snell-xboard-node.db
+is reused if xboard-snell.db does not yet exist; explicit storage paths are
+left unchanged.
 
 ## Build
 
@@ -78,7 +97,7 @@ cargo build --release
 ```sh
 cp config.example.toml config.toml
 # edit psk / panel settings
-./target/release/snell-xboard-node -c config.toml
+./target/release/xboard-snell -c config.toml
 ```
 
 `--check` validates the configuration and exits.

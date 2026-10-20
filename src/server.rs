@@ -1,6 +1,7 @@
 //! The Snell v6 service wiring: per-user keys, mode and listener lifecycle.
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use snell::{Conn, Context, Service, Socksaddr, TcpConn, v6};
@@ -28,10 +29,11 @@ impl SnellServer {
         counters: Arc<crate::accounting::Counters>,
         enforce_quota: bool,
         quota_grace: u64,
+        outbound: Option<SocketAddr>,
     ) -> io::Result<SnellServer> {
         let mode = v6::parse_mode(&config.node.mode)?;
         let handler: Arc<dyn snell::Handler> =
-            Arc::new(RelayHandler { registry: registry.clone(), counters, enforce_quota, quota_grace });
+            Arc::new(RelayHandler { registry: registry.clone(), counters, enforce_quota, quota_grace, outbound });
         let service = v6::MultiService::<crate::relay::AuthedUser>::new(v6::ServerOptions {
             psk: config.node.psk.as_bytes().to_vec(),
             mode,
@@ -158,6 +160,7 @@ mod tests {
                 counters: Arc::new(crate::accounting::Counters::default()),
                 enforce_quota: true,
                 quota_grace: 0,
+                outbound: None,
             }),
         })
         .unwrap();

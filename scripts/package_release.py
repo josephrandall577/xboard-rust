@@ -23,11 +23,11 @@ def main():
             parser.error("target and version must be safe archive name components")
 
     root = Path(__file__).resolve().parent.parent
-    executable = "snell-xboard-node.exe" if "windows" in args.target else "snell-xboard-node"
+    executable = "xboard-snell.exe" if "windows" in args.target else "xboard-snell"
     binary = root / "target" / args.target / "release" / executable
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    name = f"snell-xboard-node-{args.version}-{args.target}"
+    name = f"xboard-snell-{args.version}-{args.target}"
     windows = "windows" in args.target
     archive = output / (name + (".zip" if windows else ".tar.gz"))
 
@@ -36,8 +36,12 @@ def main():
         staging.mkdir()
         shutil.copy2(binary, staging / executable)
         (staging / executable).chmod(0o755)
-        for source, destination in [("config.example.toml", "config.example.toml"),
-                                    ("README.md", "README.md"), ("snell/LICENSE", "LICENSE")]:
+        for source, destination in [
+            ("config.example.toml", "config.example.toml"),
+            ("config.multi-node.example.toml", "config.multi-node.example.toml"),
+            ("README.md", "README.md"),
+            ("snell/LICENSE", "LICENSE"),
+        ]:
             shutil.copy2(root / source, staging / destination)
         if windows:
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
@@ -57,8 +61,9 @@ def main():
         directory = extracted / name
         command = [str(directory / executable)]
         subprocess.run(command + ["--version"], cwd=directory, check=True, timeout=30)
-        subprocess.run(command + ["--check", "-c", "config.example.toml"],
-                       cwd=directory, check=True, timeout=30)
+        for config in ("config.example.toml", "config.multi-node.example.toml"):
+            subprocess.run(command + ["--check", "-c", config],
+                           cwd=directory, check=True, timeout=30)
 
     if "linux-musl" in args.target:
         # A directly runnable Linux release must not depend on a host ELF interpreter.

@@ -192,7 +192,7 @@ python3 docs/audits/probes/raw_differential.py \
 
 现有真实 Node seam 可以复现并锁定故障；缺口是原 e2e 用户都不限速，协议互操作套件也绕过节点 RelayHandler。新增正确 seam 的回归即可预防，不需要引入新的转发框架或架构迁移。测试和探针位于 tests 与 docs/audits/probes；产品代码未保留临时 DEBUG 日志。
 
-保留的限制：节点 UDP 仍使用 IPv4 socket，::1 探针继续超时；命名 IPv6 zone 最终依赖 OS 接口配置，未实测真实链路本地 IPv6 路由；系统解析非法 UTF-8 的策略与 Go 的任意字节 string 接口不同，但不会静默改写目标。上述通过范围不扩展为全输入、全平台等价证明。
+历史审计限制（multi-node 实现前）：原单节点探针监听 IPv4，因此向 ::1 的 UDP 出站会超时；命名 IPv6 zone 最终依赖 OS 接口配置，未实测真实链路本地 IPv6 路由；系统解析非法 UTF-8 的策略与 Go 的任意字节 string 接口不同，但不会静默改写目标。v1.1.0 多节点回归新增 IPv4/IPv6 节点 ingress 的真实 TCP/UDP 出站源地址检查；这不构成对全输入、全平台或真实链路本地路由的等价证明。
 
 ## 最终代码审查
 
@@ -213,3 +213,12 @@ python3 docs/audits/probes/raw_differential.py \
 反证尝试：仅修复上传、下载只是回显上传结果，或并发连接各获得完整独立预算，会造成测试假阳性。证据核查：TCP/UDP 目标都发送与上传独立生成的固定回复，分别比较两个方向；TCP 每个模式并发两连接；额外预算检查约束共享总速率，且计费断言要求精确总量。协议地址重编码与系统拨号失败类型分别验证，没有以显示字符串作为字节保留证据。
 
 最终结论：Standards 0 项、Spec 0 项；两轴均 PASS。保留限制与验证范围见上文。
+
+
+## v1.1.0 多节点交付补充
+
+一个进程可从 [[nodes]] 配置启动多个独立节点。每个节点有显式名字、字面监听 IP/端口、PSK、Xboard URL/token/node ID、管理监听/令牌；运行时派生独立用户注册表、速率/设备限制状态、SQLite 文件及面板报告任务。旧版单节点 TOML 仍兼容：省略 [storage] 时，若新默认数据库尚不存在但旧默认 snell-xboard-node.db 存在，则继续使用旧数据库文件。多节点禁止和旧版 [node]、[panel] 或顶层管理配置混用，并拒绝重复节点名/IP、通配 IP、重复管理 socket 和重复面板身份；节点名按 ASCII 大小写折叠检查唯一，避免大小写不敏感文件系统上的数据库冲突。
+
+TCP TcpSocket::bind 和 UDP association socket 都绑定各自 listener IP（保留 IPv6 scope）；远端解析筛选相同地址族，绑定/地址族错误显式失败，不回退到进程默认出口。真实节点 e2e 测试使用 127.0.0.1 与 ::1，逐个验证 TCP 与 UDP 到达目标时的来源地址、完整负载，以及用户/账务/数据库隔离。
+
+v1.1.0 候选 xboard-snell，版本 1.1.0。根包测试 31、e2e 10、panel 4、WebSocket 1；vendored 库测试 63（显式 Go server）；根与库 Clippy 全目标 -D warnings；Go/Rust 双向 CI 已有 Linux/macOS/Windows 成功基线。打包脚本本机 ARM64 macOS archive 解包后 --version 与 --check 通过。六个 release target 的完整云构建和发布附件仍以 release-triggered Actions 为最终证据。

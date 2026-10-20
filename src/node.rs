@@ -5,6 +5,7 @@
 //! synchronization. Traffic deltas that fail to reach the panel are restored
 //! to the pending buffer and retried on the next report tick.
 
+use std::net::{SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ pub fn mark_start() {
 }
 
 pub struct Node {
+    pub name: String,
     pub config: Config,
     pub store: Store,
     pub registry: Arc<Registry>,
@@ -38,7 +40,45 @@ pub struct Node {
 }
 
 impl Node {
+    pub async fn start_many(mut config: Config) -> Result<Vec<Arc<Node>>, Box<dyn std::error::Error + Send + Sync>> {
+        config.validate()?;
+        if config.nodes.is_empty() {
+            return Ok(vec![Self::start(config).await?]);
+        }
+        let definitions = std::mem::take(&mut config.nodes);
+        let mut nodes = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let name = definition.name.clone();
+            let node_config = config.managed_node_config(&definition)?;
+            let listen: SocketAddr = node_config.node.listen.parse()?;
+            let outbound = match listen {
+                SocketAddr::V4(address) => SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), 0)),
+                SocketAddr::V6(address) => {
+                    SocketAddr::V6(SocketAddrV6::new(*address.ip(), 0, address.flowinfo(), address.scope_id()))
+                }
+            };
+            match Self::start_inner(node_config, name, Some(outbound)).await {
+                Ok(node) => nodes.push(node),
+                Err(err) => {
+                    for node in &nodes {
+                        node.shutdown().await;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+
     pub async fn start(config: Config) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_inner(config, "default".into(), None).await
+    }
+
+    async fn start_inner(
+        config: Config,
+        name: String,
+        outbound: Option<SocketAddr>,
+    ) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
         crate::mark_start();
         let store = Store::open(&config.storage.path)?;
         if config.panel.is_none() {
@@ -63,6 +103,7 @@ impl Node {
             counters.clone(),
             config.limits.enforce_quota,
             config.limits.quota_grace,
+            outbound,
         )
         .await?;
         let server = Arc::new(RwLock::new(Some(Arc::new(server))));
@@ -76,7 +117,7 @@ impl Node {
 
         let cancel = CancellationToken::new();
         let mut node =
-            Node { config, store, registry, counters, panel, server, cancel: cancel.clone(), tasks: Vec::new() };
+            Node { name, config, store, registry, counters, panel, server, cancel: cancel.clone(), tasks: Vec::new() };
 
         node.tasks.push({
             let cancel = cancel.clone();
