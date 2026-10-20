@@ -381,7 +381,7 @@ fn linux_status() -> SystemStatus {
         for line in content.lines() {
             let mut fields = line.split_whitespace();
             let key = fields.next()?;
-            let value: u64 = fields.next()?.parse().ok()? * 1024;
+            let value: u64 = fields.next()?.parse::<u64>().ok()? * 1024;
             match key {
                 "MemTotal:" => total = value,
                 "MemAvailable:" => available = value,

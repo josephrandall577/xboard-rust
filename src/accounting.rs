@@ -72,9 +72,9 @@ impl Bucket {
 
     /// Takes up to `want` tokens; returns how many were available.
     fn take(&mut self, want: u64) -> u64 {
-        let available = self.tokens.min(want as f64);
-        self.tokens -= available;
-        available as u64
+        let granted = self.tokens.min(want as f64) as u64;
+        self.tokens -= granted as f64;
+        granted
     }
 }
 
@@ -141,28 +141,44 @@ impl UserState {
     /// Returns `None` when unlimited, or how many bytes the caller may move
     /// now. The bucket is shared by all connections of the user, so
     /// concurrent streams throttle each other. Waiting happens outside the
-    /// lock and is bounded per call, which keeps large writes from starving
-    /// other flows.
+    /// lock, and each wait is capped to recheck configuration changes.
+    /// Grants are bounded by one burst; scheduling is best effort.
     pub async fn acquire(&self, upload: bool, bytes: u64) -> Option<u64> {
-        let (granted, rate) = {
-            let mut limit = self.limit.lock().unwrap();
-            if limit.bytes_per_second == 0 {
-                return None;
-            }
-            let rate = limit.bytes_per_second;
-            let bucket = if upload { &mut limit.upload } else { &mut limit.download };
-            bucket.refill(rate, Instant::now());
-            (bucket.take(bytes.min(rate)), rate)
-        };
-        if granted > 0 {
-            return Some(granted);
+        loop {
+            let wait = {
+                let mut limit = self.limit.lock().unwrap();
+                if limit.bytes_per_second == 0 {
+                    return None;
+                }
+                if bytes == 0 {
+                    return Some(0);
+                }
+                let rate = limit.bytes_per_second;
+                let bucket = if upload { &mut limit.upload } else { &mut limit.download };
+                bucket.refill(rate, Instant::now());
+                // Wait for a useful bounded piece instead of issuing a tiny
+                // socket write for every token that trickles in.
+                let want = bytes.min(rate).min(16 * 1024);
+                if bucket.tokens >= want as f64 {
+                    return Some(bucket.take(bytes.min(rate)));
+                }
+                // Compete for and debit shared credit again after every wait.
+                // Waiting alone does not grant any bytes.
+                Duration::from_secs_f64((want as f64 - bucket.tokens) / rate as f64)
+            };
+            tokio::time::sleep(wait.min(Duration::from_millis(250))).await;
         }
-        // The bucket is empty: wait for enough tokens for the next small
-        // piece instead of holding the lock or sleeping for a huge chunk.
-        let want = bytes.min(rate);
-        let wait = Duration::from_secs_f64(want as f64 / rate as f64);
-        tokio::time::sleep(wait.min(Duration::from_millis(250))).await;
-        Some(1)
+    }
+
+    /// Waits for an entire message without changing its boundaries. Requests
+    /// larger than a burst consume several grants before the caller sends it.
+    pub async fn acquire_all(&self, upload: bool, mut bytes: u64) {
+        while bytes > 0 {
+            match self.acquire(upload, bytes).await {
+                Some(granted) => bytes -= granted,
+                None => return,
+            }
+        }
     }
 
     /// Registers a new connection from `ip`.
@@ -464,6 +480,53 @@ mod tests {
         let small = state.acquire(true, 32 * 1024).await.unwrap();
         assert!(small >= 1);
         assert!(start.elapsed() < Duration::from_millis(500), "acquire blocked too long");
+    }
+
+    #[test]
+    fn bucket_keeps_fractional_credit() {
+        let mut bucket = Bucket { tokens: 1.75, updated: None };
+        assert_eq!(1, bucket.take(2));
+        assert_eq!(0.75, bucket.tokens);
+        assert_eq!(0, bucket.take(2));
+        assert_eq!(0.75, bucket.tokens);
+    }
+
+    #[tokio::test]
+    async fn speed_limit_waits_for_real_credit() {
+        let state = UserState::new(1);
+        state.set_speed_limit(1);
+        let granted = state.acquire(true, 1024).await.unwrap();
+        assert!(granted > 1, "must refill and debit real credit after waiting, granted {granted}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_the_speed_budget() {
+        let state = UserState::new(1);
+        state.set_speed_limit(1);
+        let start = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(state.acquire_all(true, 62_500), state.acquire_all(true, 62_500));
+        })
+        .await
+        .expect("shared budget must make progress");
+        // 125,000 total bytes at 1 Mbps need a full second from an empty bucket.
+        assert!(start.elapsed() >= Duration::from_millis(900), "concurrent requests minted credit");
+    }
+
+    #[tokio::test]
+    async fn waiting_request_observes_limit_removal() {
+        let state = UserState::new(1);
+        state.set_speed_limit(1);
+        let request = state.acquire_all(true, 1024 * 1024);
+        let update = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state.set_speed_limit(0);
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(request, update);
+        })
+        .await
+        .expect("pending request must observe limit removal");
     }
 
     #[test]

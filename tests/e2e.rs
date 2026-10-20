@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use snell::v6::{self, Client, ClientOptions};
-use snell::{Conn, Socksaddr, TcpConn};
+use snell::{Buffer, Conn, PacketConn, Socksaddr, TcpConn};
 use snell_xboard_node::config::{Config, NodeConfig, UserSpec};
 use snell_xboard_node::node::Node;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const PSK: &str = "integration-test-psk-0123456789";
 const MODES: [&str; 3] = ["default", "unshaped", "unsafe-raw"];
@@ -27,7 +28,7 @@ impl Harness {
         let config = Config {
             node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: mode.into(), users },
             panel: None,
-            admin: Default::default(),
+            admin: snell_xboard_node::config::AdminConfig { disabled: true, ..Default::default() },
             limits: Default::default(),
             storage: snell_xboard_node::config::StorageConfig { path: db.to_string_lossy().into_owned() },
             log: Default::default(),
@@ -221,4 +222,105 @@ async fn quota_exhausted_user_is_refused() {
     let result = round_trip(&client, &harness.address, b"over quota").await;
     assert!(result.is_err(), "user over quota must be refused");
     harness.shutdown().await;
+}
+
+// Independent replies expose download loss even if the request was truncated.
+async fn limited_tcp_transfer(harness: &Harness, seed: u8) {
+    let payload: Vec<u8> = (0..128 * 1024).map(|n| (n as u8).wrapping_add(seed)).collect();
+    let reply: Vec<u8> = payload.iter().map(|byte| byte ^ 0xa5).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = listener.local_addr().unwrap();
+    let target_reply = reply.clone();
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        stream.write_all(&target_reply).await.unwrap();
+        received
+    });
+    let proxy =
+        harness.client("limited-key").dial_conn(dial(&harness.address).await, destination.into()).await.unwrap();
+    proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(15))).unwrap();
+    proxy.write(&payload).await.unwrap();
+    proxy.close_write().await.unwrap();
+    let mut received = Vec::new();
+    let mut buffer = vec![0; 32 * 1024];
+    loop {
+        let n = proxy.read(&mut buffer).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&buffer[..n]);
+    }
+    let upload = target.await.unwrap();
+    let _ = proxy.close().await;
+    assert_eq!(payload.len(), upload.len(), "limited TCP upload length");
+    assert_eq!(payload, upload, "limited TCP upload contents");
+    assert_eq!(reply.len(), received.len(), "limited TCP download length");
+    assert_eq!(reply, received, "limited TCP download contents");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limited_tcp_preserves_concurrent_streams() {
+    for mode in MODES {
+        let mut user = spec(1, "limited-key");
+        user.speed_limit = 1;
+        let harness = Harness::start(mode, vec![user]).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(limited_tcp_transfer(&harness, 1), limited_tcp_transfer(&harness, 2));
+        })
+        .await
+        .expect("limited TCP transfers must finish");
+        let totals = harness.node.registry.state(1).unwrap().totals();
+        assert_eq!(256 * 1024, totals.upload, "mode {mode} upload accounting");
+        assert_eq!(256 * 1024, totals.download, "mode {mode} download accounting");
+        harness.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limited_udp_preserves_complete_datagrams() {
+    for mode in MODES {
+        let mut user = spec(1, "limited-key");
+        user.speed_limit = 1;
+        let harness = Harness::start(mode, vec![user]).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = socket.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let mut packets = Vec::new();
+            let mut buffer = vec![0; 65536];
+            for size in [4096, 8192] {
+                let (n, source) =
+                    tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await.unwrap().unwrap();
+                packets.push(buffer[..n].to_vec());
+                socket.send_to(&vec![0x73; size], source).await.unwrap();
+            }
+            packets
+        });
+        let proxy = harness.client("limited-key").dial_packet_conn(dial(&harness.address).await).unwrap();
+        proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(10))).unwrap();
+        let mut replies = Vec::new();
+        for size in [4096, 8192] {
+            let payload = vec![0x35; size];
+            let packet = Buffer::from_slice_with_headroom(&payload, proxy.front_headroom(), proxy.rear_headroom());
+            proxy.write_packet(packet, destination.into()).await.unwrap();
+            let mut reply = Buffer::new_packet();
+            let source = proxy.read_packet(&mut reply).await.unwrap();
+            assert_eq!(size, reply.len(), "mode {mode} UDP download length");
+            assert_eq!(Socksaddr::from(destination), source);
+            replies.push(reply.into_vec());
+        }
+        let uploads = target.await.unwrap();
+        let _ = proxy.close().await;
+        for ((size, upload), reply) in [4096, 8192].into_iter().zip(uploads).zip(replies) {
+            assert_eq!(size, upload.len(), "mode {mode} UDP upload length");
+            assert_eq!(vec![0x35; size], upload, "mode {mode} UDP upload contents");
+            assert_eq!(size, reply.len(), "mode {mode} UDP download length");
+            assert_eq!(vec![0x73; size], reply, "mode {mode} UDP download contents");
+        }
+        let totals = harness.node.registry.state(1).unwrap().totals();
+        assert_eq!(12288, totals.upload, "mode {mode} UDP upload accounting");
+        assert_eq!(12288, totals.download, "mode {mode} UDP download accounting");
+        harness.shutdown().await;
+    }
 }

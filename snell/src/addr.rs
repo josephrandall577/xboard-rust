@@ -1,7 +1,8 @@
 //! A port of sing's `M.Socksaddr`: an IP address or a domain name with a port.
 
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::borrow::Cow;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::{fmt, io};
 
 /// A socks-style address: an IP address or a domain name, plus a port.
 ///
@@ -10,7 +11,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 pub struct Socksaddr {
     pub addr: Option<IpAddr>,
     pub port: u16,
+    /// Human-readable domain. Use host_bytes for lossless encoding and host
+    /// for system resolution; invalid UTF-8 is display-only here.
     pub fqdn: String,
+    /// Original non-UTF-8 domain, when present; takes precedence over fqdn.
+    pub raw_fqdn: Option<Vec<u8>>,
+    /// IPv6 scope/zone, empty for unscoped addresses.
+    pub zone: String,
 }
 
 fn unwrap_ipv6_address(address: &str) -> &str {
@@ -28,23 +35,69 @@ fn to_ipv4_mapped(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
 impl Socksaddr {
     /// `M.SocksaddrFrom(addr, port)`.
     pub fn from_ip(addr: IpAddr, port: u16) -> Self {
-        Socksaddr { addr: Some(addr), port, fqdn: String::new() }
+        Socksaddr { addr: Some(addr), port, ..Default::default() }
     }
 
     /// `M.SocksaddrFromNetIP(addrPort)`.
     pub fn from_socket_addr(addr: SocketAddr) -> Self {
-        Self::from_ip(addr.ip(), addr.port())
+        let mut result = Self::from_ip(addr.ip(), addr.port());
+        if let SocketAddr::V6(addr) = addr
+            && addr.scope_id() != 0
+        {
+            result.zone = addr.scope_id().to_string();
+        }
+        result
     }
 
     /// `M.ParseSocksaddrHostPort(host, port)`.
     pub fn parse_host_port(host: &str, port: u16) -> Self {
-        match unwrap_ipv6_address(host).parse::<IpAddr>() {
+        let literal = unwrap_ipv6_address(host);
+        if let Some((ip, zone)) = literal.split_once('%')
+            && !zone.is_empty()
+            && let Ok(ip) = ip.parse::<Ipv6Addr>()
+        {
+            let mut result = Self::from_ip(IpAddr::V6(ip), port);
+            result.zone = zone.to_owned();
+            return result;
+        }
+        match literal.parse::<IpAddr>() {
             Ok(addr) => Self::from_ip(addr, port),
-            Err(_) => Socksaddr { addr: None, port, fqdn: host.to_string() },
+            Err(_) => Socksaddr { port, fqdn: host.to_string(), ..Default::default() },
         }
     }
 
-    /// `M.ParseSocksaddr(address)`.
+    /// Parses a wire host without substituting invalid UTF-8 bytes.
+    pub fn from_host_bytes(host: &[u8], port: u16) -> Self {
+        match std::str::from_utf8(host) {
+            Ok(host) => Self::parse_host_port(host, port),
+            Err(_) => Self {
+                port,
+                fqdn: String::from_utf8_lossy(host).into_owned(),
+                raw_fqdn: Some(host.to_vec()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Lossless host bytes for CONNECT and UDP request encodings.
+    pub fn host_bytes(&self) -> Cow<'_, [u8]> {
+        if self.is_ip() {
+            Cow::Owned(self.addr_string().into_bytes())
+        } else {
+            Cow::Borrowed(self.raw_fqdn.as_deref().unwrap_or(self.fqdn.as_bytes()))
+        }
+    }
+
+    /// Host for system resolution. Never resolve a lossy display string.
+    pub fn host(&self) -> io::Result<Cow<'_, str>> {
+        if self.is_ip() {
+            return Ok(Cow::Owned(self.addr_string()));
+        }
+        let bytes = self.raw_fqdn.as_deref().unwrap_or(self.fqdn.as_bytes());
+        std::str::from_utf8(bytes).map(Cow::Borrowed).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+    }
+
+    /// Parses a host:port pair, including bracketed IPv6 zones.
     pub fn parse(address: &str) -> Self {
         match split_host_port(address) {
             Some((host, port)) => Self::parse_host_port(host, port.parse::<u16>().unwrap_or(0)),
@@ -87,14 +140,22 @@ impl Socksaddr {
     /// The host part: the IP literal or the domain name.
     pub fn addr_string(&self) -> String {
         match self.addr {
+            Some(IpAddr::V6(addr)) if !self.zone.is_empty() => format!("{addr}%{}", self.zone),
             Some(addr) => addr.to_string(),
             None => self.fqdn.clone(),
         }
     }
 
-    /// The socket address, if this is an IP address.
+    /// The socket address for an IP with a numeric scope. Named IPv6 zones
+    /// return None and must be resolved through host(), retaining the zone.
     pub fn socket_addr(&self) -> Option<SocketAddr> {
-        self.addr.map(|addr| SocketAddr::new(addr, self.port))
+        match self.addr? {
+            IpAddr::V6(addr) => {
+                let scope = if self.zone.is_empty() { 0 } else { self.zone.parse().ok()? };
+                Some(SocketAddr::V6(SocketAddrV6::new(addr, self.port, 0, scope)))
+            }
+            addr => Some(SocketAddr::new(addr, self.port)),
+        }
     }
 }
 

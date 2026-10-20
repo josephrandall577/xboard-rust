@@ -425,7 +425,7 @@ impl Dialer for SystemDialer {
                 match destination.socket_addr() {
                     Some(addr) => TcpConn::connect(addr).await,
                     None => {
-                        let stream = TcpStream::connect((destination.fqdn.as_str(), destination.port)).await?;
+                        let stream = TcpStream::connect((destination.host()?.as_ref(), destination.port)).await?;
                         TcpConn::new(stream)
                     }
                 }

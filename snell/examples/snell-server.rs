@@ -78,7 +78,7 @@ async fn resolve(destination: &Socksaddr) -> io::Result<SocketAddr> {
     if let Some(addr) = destination.socket_addr() {
         return Ok(addr);
     }
-    lookup_host((destination.fqdn.as_str(), destination.port))
+    lookup_host((destination.host()?.as_ref(), destination.port))
         .await?
         .next()
         .ok_or_else(|| io::Error::other(format!("no address for {destination}")))

@@ -1,0 +1,12 @@
+# Diagnostic probes for the behavior audit; synthetic credentials and loopback only.
+[package]
+name = "snell-behavior-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+snell-xboard-node = { path = "../../.." }
+snell = { package = "sing-snell", path = "../../../snell" }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"

@@ -82,6 +82,18 @@ connection can be read, written and closed from different tasks, and deadlines a
 interrupt pending operations. `TcpConn` provides it for tokio TCP streams (with Go's
 `TCP_NODELAY` and keep-alive defaults); implement the trait to run snell over other transports.
 
+### Address handling
+
+Use the Socksaddr constructors when creating addresses. The model now includes
+raw_fqdn (original non-UTF-8 host bytes) and zone (IPv6 scope); external struct
+literals need these fields or a default struct update. When raw_fqdn is present
+it takes precedence over the display-only fqdn field. Clear raw_fqdn when replacing
+a domain through fqdn. Use host_bytes() for lossless protocol encoding and host()
+for system resolution. The system dialer rejects non-UTF-8 hosts with InvalidInput
+instead of resolving a replacement string. Numeric IPv6 scopes convert directly
+to socket addresses; named zones are passed intact to the OS resolver. UDP's IP
+address encoding has no zone field, matching the Go reference.
+
 ## Tests
 
 ```sh

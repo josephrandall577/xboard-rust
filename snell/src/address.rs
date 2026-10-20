@@ -24,21 +24,22 @@ fn put_port(buffer: &mut Buffer, port: u16) {
 ///
 /// Surge 6.7.0 (11520): SNConnectorV4::targetHandshakeData: CONNECT targets are host strings even for literal IPs.
 pub fn write_connect_address(buffer: &mut Buffer, destination: &Socksaddr) -> io::Result<()> {
-    let host = destination.addr_string();
+    let host = destination.host_bytes();
     if host.len() > 255 {
-        return Err(error::new_invalid(format!("snell: host too long: {host}")));
+        return Err(error::new_invalid("snell: host too long"));
     }
     buffer.write_byte(host.len() as u8);
-    buffer.write_all(host.as_bytes());
+    buffer.write_all(&host);
     put_port(buffer, destination.port);
     Ok(())
 }
 
 pub fn read_connect_address(reader: &mut Buffer) -> io::Result<Socksaddr> {
-    let host = read_sock_string(reader)?;
+    let len = reader.read_byte()? as usize;
+    let host = reader.read_bytes(len)?.to_vec();
     let mut port = [0u8; 2];
     reader.read_full(&mut port)?;
-    Ok(Socksaddr::parse_host_port(&host, u16::from_be_bytes(port)))
+    Ok(Socksaddr::from_host_bytes(&host, u16::from_be_bytes(port)))
 }
 
 /// `udpIPSerializer.WriteAddrPort`: family 0x04 / 0x06, address, port.
@@ -86,12 +87,12 @@ pub fn write_udp_request_address(buffer: &mut Buffer, destination: &Socksaddr) -
         buffer.write_byte(0x00);
         return write_ip_addr_port(buffer, &destination.unwrap());
     }
-    let host = &destination.fqdn;
+    let host = destination.host_bytes();
     if host.is_empty() || host.len() > 255 {
-        return Err(error::new_invalid(format!("snell: invalid udp host: {host}")));
+        return Err(error::new_invalid("snell: invalid udp host"));
     }
     buffer.write_byte(host.len() as u8);
-    buffer.write_all(host.as_bytes());
+    buffer.write_all(&host);
     put_port(buffer, destination.port);
     Ok(())
 }
@@ -99,10 +100,10 @@ pub fn write_udp_request_address(buffer: &mut Buffer, destination: &Socksaddr) -
 pub fn read_udp_request_address(buffer: &mut Buffer) -> io::Result<Socksaddr> {
     let first = buffer.read_byte()?;
     if first != 0x00 {
-        let host = String::from_utf8_lossy(buffer.read_bytes(first as usize)?).into_owned();
+        let host = buffer.read_bytes(first as usize)?.to_vec();
         let port = buffer.read_bytes(2)?;
         let port = u16::from_be_bytes([port[0], port[1]]);
-        return Ok(Socksaddr::parse_host_port(&host, port));
+        return Ok(Socksaddr::from_host_bytes(&host, port));
     }
     read_ip_addr_port(buffer)
 }

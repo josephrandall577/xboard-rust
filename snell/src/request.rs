@@ -41,7 +41,7 @@ impl Request {
     pub fn len(&self) -> usize {
         let request_len = 3 + self.client_id.len();
         match self.command {
-            COMMAND_CONNECT | COMMAND_CONNECT_V2 => request_len + 1 + self.destination.addr_string().len() + 2,
+            COMMAND_CONNECT | COMMAND_CONNECT_V2 => request_len + 1 + self.destination.host_bytes().len() + 2,
             _ => request_len,
         }
     }

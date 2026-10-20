@@ -75,8 +75,7 @@ impl Handler for RelayHandler {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         tokio::spawn(async move {
-            let meter = Meter::new(&user, &state);
-            let result = relay_tcp(conn.clone(), destination.clone(), meter).await;
+            let result = relay_tcp(conn.clone(), destination.clone(), state).await;
             if let Err(err) = &result {
                 debug!(user = user.id, destination = %destination, error = %err, "tcp relay ended with error");
             }
@@ -104,8 +103,7 @@ impl Handler for RelayHandler {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         tokio::spawn(async move {
-            let meter = PacketMeter::new(&user, &state);
-            let result = relay_udp(conn.clone(), meter).await;
+            let result = relay_udp(conn.clone(), state).await;
             if let Err(err) = &result {
                 debug!(user = user.id, error = %err, "udp relay ended with error");
             }
@@ -136,36 +134,12 @@ fn close_packet_refused(conn: Arc<dyn PacketConn>, on_close: Option<CloseHandler
     });
 }
 
-/// Per-connection metering state shared by the two copy directions.
-struct Meter {
-    state: Arc<UserState>,
-    speed_limit: bool,
-    used: u64,
-}
-
-impl Meter {
-    fn new(user: &User, state: &Arc<UserState>) -> Meter {
-        Meter { state: state.clone(), speed_limit: user.speed_limit > 0, used: 0 }
-    }
-
-    /// Limits the next chunk, returning how many bytes may move now.
-    async fn clamp(&mut self, upload: bool, bytes: usize) -> usize {
-        if self.speed_limit
-            && let Some(granted) = self.state.acquire(upload, bytes as u64).await
-        {
-            return (granted as usize).max(1).min(bytes);
-        }
-        bytes
-    }
-}
-
-async fn relay_tcp(client: Arc<dyn Conn>, destination: Socksaddr, meter: Meter) -> io::Result<()> {
+async fn relay_tcp(client: Arc<dyn Conn>, destination: Socksaddr, state: Arc<UserState>) -> io::Result<()> {
     let upstream = connect_tcp(&destination).await?;
-    let meter = Arc::new(tokio::sync::Mutex::new(meter));
     let upload = {
-        let (client, upstream, meter) = (client.clone(), upstream.clone(), meter.clone());
+        let (client, upstream, state) = (client.clone(), upstream.clone(), state.clone());
         async move {
-            let result = copy_metered(&client, &upstream, true, &meter).await;
+            let result = copy_metered(&client, &upstream, true, &state).await;
             match &result {
                 Ok(()) => {
                     let _ = upstream.close_write().await;
@@ -178,9 +152,9 @@ async fn relay_tcp(client: Arc<dyn Conn>, destination: Socksaddr, meter: Meter) 
         }
     };
     let download = {
-        let (client, upstream, meter) = (client.clone(), upstream.clone(), meter.clone());
+        let (client, upstream, state) = (client.clone(), upstream.clone(), state.clone());
         async move {
-            let result = copy_metered(&upstream, &client, false, &meter).await;
+            let result = copy_metered(&upstream, &client, false, &state).await;
             match &result {
                 Ok(()) => {
                     let _ = client.close_write().await;
@@ -203,7 +177,7 @@ async fn copy_metered(
     source: &Arc<dyn Conn>,
     destination: &Arc<dyn Conn>,
     upload: bool,
-    meter: &tokio::sync::Mutex<Meter>,
+    state: &UserState,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 32 * 1024];
     loop {
@@ -211,52 +185,31 @@ async fn copy_metered(
         if n == 0 {
             return Ok(());
         }
-        let allowed = meter.lock().await.clamp(upload, n).await;
-        destination.write(&buf[..allowed]).await?;
-        let mut meter = meter.lock().await;
-        if upload {
-            meter.state.record_upload(allowed as u64);
-        } else {
-            meter.state.record_download(allowed as u64);
+        let mut offset = 0;
+        while offset < n {
+            let allowed = state.acquire(upload, (n - offset) as u64).await.unwrap_or((n - offset) as u64) as usize;
+            destination.write(&buf[offset..offset + allowed]).await?;
+            if upload {
+                state.record_upload(allowed as u64);
+            } else {
+                state.record_download(allowed as u64);
+            }
+            offset += allowed;
         }
-        meter.used = meter.used.saturating_add(allowed as u64);
     }
 }
 
 async fn connect_tcp(destination: &Socksaddr) -> io::Result<Arc<dyn Conn>> {
     let stream = match destination.socket_addr() {
         Some(addr) => TcpStream::connect(addr).await?,
-        None => TcpStream::connect((destination.fqdn.as_str(), destination.port)).await?,
+        None => TcpStream::connect((destination.host()?.as_ref(), destination.port)).await?,
     };
     let conn = TcpConn::new(stream)?;
     Ok(Arc::new(conn))
 }
 
 /// UDP relay with a single association socket.
-///
-/// Each client-side destination is resolved once and the replies are matched
-/// by the socket's peer, like the example server.
-struct PacketMeter {
-    state: Arc<UserState>,
-    speed_limit: bool,
-}
-
-impl PacketMeter {
-    fn new(user: &User, state: &Arc<UserState>) -> PacketMeter {
-        PacketMeter { state: state.clone(), speed_limit: user.speed_limit > 0 }
-    }
-
-    async fn clamp(&self, upload: bool, bytes: usize) -> usize {
-        if self.speed_limit
-            && let Some(granted) = self.state.acquire(upload, bytes as u64).await
-        {
-            return (granted as usize).max(1).min(bytes);
-        }
-        bytes
-    }
-}
-
-async fn relay_udp(conn: Arc<dyn PacketConn>, meter: PacketMeter) -> io::Result<()> {
+async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>) -> io::Result<()> {
     // Use an unconnected socket and track the last destination. Snell UDP
     // tunnels are request/response pairs in practice; replies from any of
     // the destinations in the tunnel are forwarded back to the client.
@@ -264,8 +217,7 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, meter: PacketMeter) -> io::Result<
     let downlink = {
         let socket = socket.clone();
         let conn = conn.clone();
-        let state = meter.state.clone();
-        let speed_limit = meter.speed_limit;
+        let state = state.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -273,20 +225,12 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, meter: PacketMeter) -> io::Result<
                     Ok(read) => read,
                     Err(_) => return,
                 };
-                let allowed = if speed_limit {
-                    match state.acquire(false, n as u64).await {
-                        Some(granted) => (granted as usize).max(1).min(n),
-                        None => n,
-                    }
-                } else {
-                    n
-                };
-                let buffer =
-                    Buffer::from_slice_with_headroom(&buf[..allowed], conn.front_headroom(), conn.rear_headroom());
+                state.acquire_all(false, n as u64).await;
+                let buffer = Buffer::from_slice_with_headroom(&buf[..n], conn.front_headroom(), conn.rear_headroom());
                 if conn.write_packet(buffer, Socksaddr::from(addr)).await.is_err() {
                     return;
                 }
-                state.record_download(allowed as u64);
+                state.record_download(n as u64);
             }
         })
     };
@@ -298,9 +242,9 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, meter: PacketMeter) -> io::Result<
                 continue;
             };
             let bytes = buffer.bytes();
-            let allowed = meter.clamp(true, bytes.len()).await;
-            if socket.send_to(&bytes[..allowed], addr).await.is_ok() {
-                meter.state.record_upload(allowed as u64);
+            state.acquire_all(true, bytes.len() as u64).await;
+            if let Ok(sent) = socket.send_to(bytes, addr).await {
+                state.record_upload(sent as u64);
             }
         }
     }
@@ -314,7 +258,9 @@ async fn resolve_udp(destination: &Socksaddr) -> Option<SocketAddr> {
     if let Some(addr) = destination.socket_addr() {
         return Some(addr);
     }
-    match tokio::time::timeout(UDP_READ_TIMEOUT, lookup_host((destination.fqdn.as_str(), destination.port))).await {
+    match tokio::time::timeout(UDP_READ_TIMEOUT, lookup_host((destination.host().ok()?.as_ref(), destination.port)))
+        .await
+    {
         Ok(Ok(mut addresses)) => addresses.next(),
         _ => None,
     }
