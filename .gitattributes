@@ -1,0 +1,2 @@
+# Keep protocol fixtures and scripts byte-stable on every runner.
+* text=auto eol=lf
