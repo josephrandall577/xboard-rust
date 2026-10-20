@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            snell
+      - name: Node tests
+        run: cargo test --locked
+      - name: Library tests
+        run: cargo test --manifest-path snell/Cargo.toml --locked --lib --test address --test loopback
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  interop:
+    name: Go reference interoperability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: snell/interop/go.mod
+          cache-dependency-path: snell/interop/go.sum
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: snell
+      - name: Build both reference wrappers
+        run: |
+          cargo build --manifest-path snell/Cargo.toml --locked --example snell-server
+          go -C snell/interop build -o "$RUNNER_TEMP/go-snell-server" ./snell-server
+      - name: Go clients against Rust server
+        working-directory: snell/interop
+        env:
+          SNELL_SERVER_BIN: ${{ github.workspace }}/snell/target/debug/examples/snell-server
+        run: go test -count=1 -timeout 10m ./...
+      - name: Rust clients against Go server
+        env:
+          SNELL_SERVER_BIN: ${{ runner.temp }}/go-snell-server
+        run: cargo test --manifest-path snell/Cargo.toml --locked --test official

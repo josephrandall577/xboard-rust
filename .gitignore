@@ -3,3 +3,6 @@
 *.db-shm
 *.db-wal
 config.toml
+
+/dist/
+__pycache__/

@@ -25,6 +25,48 @@ quota enforcement, alive-IP reporting and node status/metrics.
 - **Local admin API** and SQLite persistence, so the node works standalone
   and the data plane never depends on the panel being up.
 
+## Download binaries
+
+Publish a GitHub Release to start the **Release binaries** workflow. It builds
+from that Release's tag and attaches the archives and a combined `SHA256SUMS`
+file to the same Release after all six platforms finish successfully. Draft
+Releases do not start builds; publishing a regular Release or a prerelease does.
+A Git tag push alone does not publish binaries.
+
+| Platform | Architecture | Target / asset suffix |
+| --- | --- | --- |
+| Linux | x86_64 | `x86_64-unknown-linux-musl.tar.gz` |
+| Linux | ARM64 | `aarch64-unknown-linux-musl.tar.gz` |
+| macOS | Intel | `x86_64-apple-darwin.tar.gz` |
+| macOS | Apple Silicon | `aarch64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `x86_64-pc-windows-msvc.zip` |
+| Windows | ARM64 | `aarch64-pc-windows-msvc.zip` |
+
+Assets are named `snell-xboard-node-<release-tag>-<target>.<archive-type>`.
+Each archive contains the executable, `config.example.toml`, this README and
+the license. Linux binaries use static musl and bundled SQLite; Windows
+binaries statically link the MSVC runtime. macOS binaries are unsigned.
+
+Download the matching archive from [Releases](https://github.com/josephrandall577/xboard-snell/releases),
+extract it, copy `config.example.toml` to `config.toml`, and edit the panel
+settings and server PSK. On Linux/macOS:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+# macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+./snell-xboard-node --check -c config.toml
+./snell-xboard-node -c config.toml
+```
+
+On Windows, run `Get-FileHash <archive.zip> -Algorithm SHA256` and compare it
+with `SHA256SUMS`, then run `.\snell-xboard-node.exe -c config.toml` in PowerShell.
+
+Maintainers can use **Actions → Release binaries → Run workflow** to verify
+the same build and packaging steps without publishing a Release. Manual runs
+provide Actions artifacts and do not attach files to a Release. CI separately
+runs node/library tests on Linux, macOS and Windows, plus bidirectional Go
+interoperability on Linux.
+
 ## Build
 
 ```sh
