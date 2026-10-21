@@ -71,7 +71,8 @@ interoperability on Linux.
 
 One process can run several independent panel-backed nodes. Define each node in
 [[nodes]] with a unique name and a distinct, specific local IP address (not a
-wildcard); each node also needs its own listening port, PSK, panel node ID and
+wildcard). IPv4-mapped IPv6 listen addresses are rejected; use native IPv4
+or IPv6 addresses. Each node also needs its own listening port, PSK, panel node ID and
 unique management API listen address. TCP and UDP destination sockets bind to
 the same local IP as the corresponding Snell listener. If the requested
 address family or local bind is unavailable, the connection fails rather than
@@ -81,7 +82,9 @@ independent per node. Shared quota and log settings remain at the top level.
 
 Start from config.multi-node.example.toml; do not combine [[nodes]] with the
 legacy [node] / [panel] configuration. Distinct IPs must already be assigned
-to this host. Management API endpoints are configured per node. When upgrading
+to this host. Management API endpoints are configured per node. Overlapping
+management and Snell endpoints are rejected, and an occupied management port
+fails startup. When upgrading
 an installation whose config omits [storage], an existing snell-xboard-node.db
 is reused if xboard-snell.db does not yet exist; explicit storage paths are
 left unchanged.
@@ -150,8 +153,12 @@ already exist keep running.
   `limits.device_ttl` seconds.
 - **Speed limit** is per user, in Mbps, shared by all of the user's
   connections.
-- A failed panel report leaves the traffic pending; the next report retries
-  it, so bytes are not lost during panel outages.
+- Local traffic totals and pending panel reports are saved together in SQLite.
+  Failed reports remain queued across restarts; the next report retries them.
+  Shutdown stops TCP/UDP relays before persisting and reporting the final bytes.
+- Reports use at-least-once delivery. If the panel accepts a report but its
+  response is lost, retrying can count those bytes twice; the panel API has no
+  idempotency key to resolve that ambiguity.
 
 ## Layout
 

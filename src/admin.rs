@@ -61,8 +61,12 @@ pub fn router(state: AdminState) -> Router {
 }
 
 pub async fn serve(listen: &str, state: AdminState) -> std::io::Result<()> {
-    let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    serve_listener(listener, state).await
+}
+
+pub async fn serve_listener(listener: tokio::net::TcpListener, state: AdminState) -> std::io::Result<()> {
+    let router = router(state);
     let local = listener.local_addr()?;
     info!(%local, "admin api listening");
     axum::serve(listener, router).await

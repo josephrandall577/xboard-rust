@@ -406,8 +406,8 @@ impl Config {
             }
             let mut names = std::collections::HashSet::new();
             let mut ips = std::collections::HashSet::new();
-            let mut listeners = std::collections::HashSet::new();
-            let mut admins = std::collections::HashSet::new();
+            let mut listeners = Vec::new();
+            let mut admins = Vec::new();
             let mut panels = std::collections::HashSet::new();
             for node in &self.nodes {
                 if node.name.is_empty()
@@ -418,18 +418,18 @@ impl Config {
                 }
                 let address: std::net::SocketAddr =
                     node.listen.parse().map_err(|_| ConfigError::InvalidNodeListen(node.name.clone()))?;
-                if address.ip().is_unspecified() || !ips.insert(address.ip()) || !listeners.insert(address) {
+                let mapped = matches!(address.ip(), std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some());
+                if mapped || address.ip().is_unspecified() || !ips.insert(address.ip()) {
                     return Err(ConfigError::DuplicateNodeIp(node.listen.clone()));
                 }
+                listeners.push(address);
                 if !node.admin.disabled {
                     if node.admin.token.is_empty() {
                         return Err(ConfigError::InvalidAdminToken(node.name.clone()));
                     }
                     let admin: std::net::SocketAddr =
                         node.admin.listen.parse().map_err(|_| ConfigError::InvalidAdminListen(node.name.clone()))?;
-                    if listeners.contains(&admin) || !admins.insert(admin) {
-                        return Err(ConfigError::DuplicateAdminListen(node.admin.listen.clone()));
-                    }
+                    admins.push(admin);
                 }
                 let panel_identity = (
                     node.panel.url.trim_end_matches('/').to_string(),
@@ -443,6 +443,13 @@ impl Config {
                 validate_node_credentials(&node.psk, &node.mode)?;
                 if node.panel.url.is_empty() || node.panel.token.is_empty() {
                     return Err(ConfigError::InvalidPanel(node.name.clone()));
+                }
+            }
+            for (index, &admin) in admins.iter().enumerate() {
+                if listeners.iter().any(|&listener| listen_addresses_overlap(admin, listener))
+                    || admins[..index].iter().any(|&other| listen_addresses_overlap(admin, other))
+                {
+                    return Err(ConfigError::DuplicateAdminListen(admin.to_string()));
                 }
             }
             return Ok(());
@@ -460,6 +467,19 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn listen_addresses_overlap(first: std::net::SocketAddr, second: std::net::SocketAddr) -> bool {
+    if first.port() == 0 || first.port() != second.port() {
+        return false;
+    }
+    let first_ip = first.ip().to_canonical();
+    let second_ip = second.ip().to_canonical();
+    // IPv6 wildcard sockets may also accept IPv4 on supported platforms.
+    first_ip == second_ip
+        || first_ip == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        || second_ip == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        || (first_ip.is_ipv4() && second_ip.is_ipv4() && (first_ip.is_unspecified() || second_ip.is_unspecified()))
 }
 
 fn managed_storage_path(base: &str, name: &str) -> String {
@@ -521,7 +541,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "node {name}: listen must be a literal IP socket address")
             }
             ConfigError::DuplicateNodeIp(listen) => {
-                write!(f, "managed nodes require distinct, specific listen IPs: {listen}")
+                write!(f, "managed nodes require distinct, specific, non-mapped listen IPs: {listen}")
             }
             ConfigError::DuplicateAdminListen(listen) => {
                 write!(f, "duplicate managed-node admin listen address: {listen}")

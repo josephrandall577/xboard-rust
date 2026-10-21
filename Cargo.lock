@@ -1963,6 +1963,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2502,7 +2503,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xboard-snell"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "argon2",
  "async-trait",

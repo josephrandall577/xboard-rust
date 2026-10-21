@@ -288,10 +288,19 @@ struct PanelUser {
     id: i64,
     #[serde(default)]
     uuid: String,
-    #[serde(default)]
+    // Xboard sends null for groups whose limit is unset.
+    #[serde(default, deserialize_with = "null_as_zero")]
     speed_limit: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_zero")]
     device_limit: u32,
+}
+
+fn null_as_zero<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl From<PanelUser> for UserSpec {

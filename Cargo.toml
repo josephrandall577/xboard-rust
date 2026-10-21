@@ -1,6 +1,6 @@
 [package]
 name = "xboard-snell"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
@@ -26,7 +26,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 socket2 = "0.6.5"
 tokio = { version = "1.53.2", features = ["net", "io-util", "rt-multi-thread", "signal", "sync", "time", "macros"] }
-tokio-util = "0.7.20"
+tokio-util = { version = "0.7.20", features = ["rt"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots", "url"] }
 futures-util = { version = "0.3", features = ["sink"] }
 toml = "1.1.8"

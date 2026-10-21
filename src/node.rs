@@ -9,14 +9,14 @@ use std::net::{SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::accounting::{Counters, Registry};
 use crate::admin::AdminState;
-use crate::config::{Config, Traffic};
+use crate::config::Config;
 use crate::panel::{PanelClient, SystemStatus, build_metrics, log_panel_error, system_status};
 use crate::server::SnellServer;
 use crate::store::Store;
@@ -36,7 +36,9 @@ pub struct Node {
     pub panel: Option<Arc<PanelClient>>,
     pub server: Arc<RwLock<Option<Arc<SnellServer>>>>,
     cancel: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    report_lock: Arc<Mutex<()>>,
+    stopped: OnceCell<()>,
 }
 
 impl Node {
@@ -97,6 +99,9 @@ impl Node {
             None => None,
         };
 
+        // Bind every required endpoint before reporting startup success.
+        let admin_listener =
+            if config.admin.disabled { None } else { Some(tokio::net::TcpListener::bind(&config.admin.listen).await?) };
         let server = SnellServer::start(
             &config,
             registry.clone(),
@@ -116,19 +121,27 @@ impl Node {
         };
 
         let cancel = CancellationToken::new();
-        let mut node =
-            Node { name, config, store, registry, counters, panel, server, cancel: cancel.clone(), tasks: Vec::new() };
+        let mut node = Node {
+            name,
+            config,
+            store,
+            registry,
+            counters,
+            panel,
+            server,
+            cancel: cancel.clone(),
+            tasks: Mutex::new(Vec::new()),
+            report_lock: Arc::new(Mutex::new(())),
+            stopped: OnceCell::new(),
+        };
 
-        node.tasks.push({
+        node.tasks.get_mut().push({
             let cancel = cancel.clone();
-            let admin_config = node.config.admin.clone();
             tokio::spawn(async move {
-                if admin_config.disabled {
-                    return;
-                }
+                let Some(listener) = admin_listener else { return };
                 tokio::select! {
                     _ = cancel.cancelled() => {}
-                    result = crate::admin::serve(&admin_config.listen, admin_state) => {
+                    result = crate::admin::serve_listener(listener, admin_state) => {
                         if let Err(err) = result {
                             error!(error = %err, "admin api stopped");
                         }
@@ -139,16 +152,16 @@ impl Node {
 
         node.spawn_panel_tasks();
 
-        // Exactly one task may drain the pending counters: the push loop in
-        // panel mode (it persists after each successful report), or the
-        // local flush loop in standalone mode.
+        // The report lock serializes periodic drains with final shutdown.
+        // Panel mode persists both usage and undelivered deltas atomically.
         if node.panel.is_none() {
-            node.tasks.push({
+            node.tasks.get_mut().push({
                 let cancel = cancel.clone();
                 let registry = node.registry.clone();
                 let store = node.store.clone();
+                let report_lock = node.report_lock.clone();
                 tokio::spawn(async move {
-                    flush_loop(registry, store, cancel).await;
+                    flush_loop(registry, store, cancel, report_lock).await;
                 })
             });
         }
@@ -170,7 +183,7 @@ impl Node {
         let registry = self.registry.clone();
         let server = self.server.clone();
         let panel_clone = panel.clone();
-        self.tasks.push(tokio::spawn(async move {
+        self.tasks.get_mut().push(tokio::spawn(async move {
             pull_loop(panel_clone, store, registry, server, pull_interval, cancel).await;
         }));
 
@@ -179,8 +192,9 @@ impl Node {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         let panel_clone = panel.clone();
-        self.tasks.push(tokio::spawn(async move {
-            push_loop(panel_clone, store, registry, counters, push_interval, cancel).await;
+        let report_lock = self.report_lock.clone();
+        self.tasks.get_mut().push(tokio::spawn(async move {
+            push_loop(panel_clone, store, registry, counters, push_interval, cancel, report_lock).await;
         }));
 
         // Panel WebSocket push (optional): polling above stays the baseline,
@@ -195,11 +209,11 @@ impl Node {
             let machine_id = self.config.panel.as_ref().and_then(|panel| panel.machine_id);
             let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<crate::config::UserSpec>>();
             let events_store = store.clone();
-            self.tasks.push(tokio::spawn(async move {
+            self.tasks.get_mut().push(tokio::spawn(async move {
                 crate::ws::run(ws_url, token, node_id, machine_id, store, events_tx, cancel).await;
             }));
             let cancel = self.cancel.clone();
-            self.tasks.push(tokio::spawn(async move {
+            self.tasks.get_mut().push(tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -218,43 +232,34 @@ impl Node {
         }
     }
 
-    /// Gracefully stops the node: refuses new connections, flushes pending
-    /// traffic to the panel and the store, then waits for the tasks.
+    /// Stops and joins metered connections before persisting final usage.
+    /// Failed panel deliveries remain in the durable outbox for retry.
     pub async fn shutdown(&self) {
-        info!("shutting down");
-        self.counters.set_shutting_down();
-        if let Some(server) = self.server.write().await.take() {
-            server.stop();
-        }
-        floor_flush(&self.registry, &self.store);
-        if let Some(panel) = &self.panel {
-            let traffic = collect_traffic(&self.registry);
-            if !traffic.is_empty() {
-                match panel.api_version() {
-                    1 => panel.push_traffic(&traffic).await.map(|_| ()).map_err(|e| e.to_string()),
-                    _ => {
-                        let online = collect_online(&self.registry);
-                        let status = system_status();
-                        let metrics = current_metrics(
-                            &self.registry,
-                            &self.counters,
-                            self.store.list_users().map(|u| u.len()).unwrap_or(0),
-                        );
-                        panel
-                            .report(&traffic, &[], &online, status, metrics)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    }
+        self.stopped
+            .get_or_init(|| async {
+                info!("shutting down");
+                self.counters.set_shutting_down();
+                if let Some(server) = self.server.write().await.take() {
+                    server.stop();
+                    server.wait().await;
                 }
-                .map_err(|err| warn!(error = %err, "final traffic report failed"))
-                .ok();
-            }
-        }
-        self.cancel.cancel();
-        for task in &self.tasks {
-            task.abort();
-        }
+                self.cancel.cancel();
+                // Let an in-flight report finish before taking its final snapshot.
+                let _guard = self.report_lock.lock().await;
+                if let Some(panel) = &self.panel {
+                    report_pending(panel, &self.store, &self.registry, &self.counters).await;
+                } else {
+                    floor_flush(&self.registry, &self.store);
+                }
+                let tasks = std::mem::take(&mut *self.tasks.lock().await);
+                for task in &tasks {
+                    task.abort();
+                }
+                for task in tasks {
+                    let _ = task.await;
+                }
+            })
+            .await;
     }
 
     pub async fn wait_for_signal(&self) {
@@ -349,67 +354,62 @@ async fn push_loop(
     counters: Arc<Counters>,
     interval: Duration,
     cancel: CancellationToken,
+    report_lock: Arc<Mutex<()>>,
 ) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
-        let traffic = collect_traffic(&registry);
-        if !traffic.is_empty() {
-            match panel.api_version() {
-                1 => {
-                    if let Err(err) = panel.push_traffic(&traffic).await {
-                        log_panel_error("traffic push", &err);
-                        // Restore so the next tick retries instead of losing bytes.
-                        for (id, delta) in &traffic {
-                            if let Some(state) = registry.state(*id) {
-                                state.restore_pending(*delta);
-                            }
-                        }
-                        continue;
-                    }
-                    let alive = collect_alive(&registry);
-                    if let Err(err) = panel.push_alive(&alive).await {
-                        log_panel_error("alive push", &err);
-                    }
-                    if let Err(err) = panel.push_status(system_status()).await {
-                        log_panel_error("status push", &err);
-                    }
-                }
-                _ => {
-                    let online = collect_online(&registry);
-                    let alive = collect_alive(&registry);
-                    let total_users = store.list_users().map(|users| users.len()).unwrap_or(0);
-                    let metrics = current_metrics(&registry, &counters, total_users);
-                    if let Err(err) = panel.report(&traffic, &alive, &online, system_status(), metrics).await {
-                        log_panel_error("report", &err);
-                        for (id, delta) in &traffic {
-                            if let Some(state) = registry.state(*id) {
-                                state.restore_pending(*delta);
-                            }
-                        }
-                        continue;
-                    }
-                }
-            }
-            // The panel accepted the report; persist the same deltas so the
-            // local view stays complete across restarts.
-            if let Err(err) = store.add_traffic(&traffic) {
-                warn!(error = %err, "failed to persist traffic counters");
-            }
+        let _guard = report_lock.lock().await;
+        if cancel.is_cancelled() {
+            break;
         }
+        report_pending(&panel, &store, &registry, &counters).await;
     }
 }
 
-/// Aggregates pending traffic into one report and adds it to the registry
-/// totals. Returned deltas are what the panel should be told about.
-/// Drains the pending counters. The returned deltas are what the panel
-/// receives; the store accumulates the same deltas once the report succeeds.
-fn collect_traffic(registry: &Registry) -> Vec<(i64, Traffic)> {
-    let mut deltas: Vec<(i64, Traffic)> = registry.take_pending();
-    deltas.retain(|(_, delta)| !delta.is_zero());
-    deltas
+/// Local accounting and the durable panel outbox commit together. Callers
+/// serialize delivery, so shutdown never drains a periodic report's bytes.
+async fn report_pending(panel: &PanelClient, store: &Store, registry: &Registry, counters: &Counters) {
+    if let Err(err) = registry.persist_pending(|deltas| store.stage_traffic(deltas)) {
+        warn!(error = %err, "failed to persist panel traffic");
+        return;
+    }
+    let traffic = match store.pending_traffic() {
+        Ok(traffic) => traffic,
+        Err(err) => {
+            warn!(error = %err, "failed to load panel traffic");
+            return;
+        }
+    };
+    if traffic.is_empty() {
+        return;
+    }
+    let result = match panel.api_version() {
+        1 => panel.push_traffic(&traffic).await,
+        _ => {
+            let online = collect_online(registry);
+            let alive = collect_alive(registry);
+            let metrics = current_metrics(registry, counters, store.list_users().map(|users| users.len()).unwrap_or(0));
+            panel.report(&traffic, &alive, &online, system_status(), metrics).await
+        }
+    };
+    if let Err(err) = result {
+        log_panel_error("traffic report", &err);
+        return;
+    }
+    if let Err(err) = store.acknowledge_traffic(&traffic) {
+        warn!(error = %err, "failed to acknowledge panel traffic");
+    }
+    if panel.api_version() == 1 {
+        if let Err(err) = panel.push_alive(&collect_alive(registry)).await {
+            log_panel_error("alive push", &err);
+        }
+        if let Err(err) = panel.push_status(system_status()).await {
+            log_panel_error("status push", &err);
+        }
+    }
 }
 
 fn collect_alive(registry: &Registry) -> Vec<(i64, Vec<String>)> {
@@ -454,36 +454,25 @@ fn current_metrics(registry: &Registry, counters: &Counters, total_users: usize)
     )
 }
 
-async fn flush_loop(registry: Arc<Registry>, store: Store, cancel: CancellationToken) {
+async fn flush_loop(registry: Arc<Registry>, store: Store, cancel: CancellationToken, report_lock: Arc<Mutex<()>>) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = tokio::time::sleep(Duration::from_secs(10)) => {}
         }
-        // Without a panel, persist locally here. With a panel, the push loop
-        // persists after a successful report instead.
-        let deltas = registry.take_pending();
-        if deltas.is_empty() {
-            continue;
+        let _guard = report_lock.lock().await;
+        if cancel.is_cancelled() {
+            break;
         }
-        if let Err(err) = store.add_traffic(&deltas) {
+        if let Err(err) = registry.persist_pending(|deltas| store.add_traffic(deltas)) {
             warn!(error = %err, "failed to persist traffic counters");
-            for (id, delta) in &deltas {
-                if let Some(state) = registry.state(*id) {
-                    state.restore_pending(*delta);
-                }
-            }
         }
     }
 }
 
 /// Synchronously drains pending counters into the store during shutdown.
 fn floor_flush(registry: &Registry, store: &Store) {
-    let deltas = registry.take_pending();
-    if deltas.is_empty() {
-        return;
-    }
-    if let Err(err) = store.add_traffic(&deltas) {
+    if let Err(err) = registry.persist_pending(|deltas| store.add_traffic(deltas)) {
         error!(error = %err, "failed to flush traffic during shutdown");
     }
 }

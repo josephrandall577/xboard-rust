@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use snell::{Buffer, CloseHandler, Conn, Context, Handler, PacketConn, Socksaddr, TcpConn};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket, lookup_host};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::debug;
 
 use crate::accounting::{Counters, Registry, UserState};
@@ -32,6 +33,8 @@ pub struct RelayHandler {
     pub quota_grace: u64,
     /// When set, all destination sockets bind to this listener's local IP.
     pub outbound: Option<SocketAddr>,
+    pub cancel: CancellationToken,
+    pub tasks: TaskTracker,
 }
 
 impl RelayHandler {
@@ -77,8 +80,13 @@ impl Handler for RelayHandler {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         let outbound = self.outbound;
-        tokio::spawn(async move {
-            let result = relay_tcp(conn.clone(), destination.clone(), state, outbound).await;
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            let result = tokio::select! {
+                _ = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "node stopped")),
+                result = relay_tcp(conn.clone(), destination.clone(), state, outbound) => result,
+            };
+            let _ = conn.close().await;
             if let Err(err) = &result {
                 debug!(user = user.id, destination = %destination, error = %err, "tcp relay ended with error");
             }
@@ -106,8 +114,13 @@ impl Handler for RelayHandler {
         let registry = self.registry.clone();
         let counters = self.counters.clone();
         let outbound = self.outbound;
-        tokio::spawn(async move {
-            let result = relay_udp(conn.clone(), state, outbound).await;
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            let result = tokio::select! {
+                _ = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "node stopped")),
+                result = relay_udp(conn.clone(), state, outbound) => result,
+            };
+            let _ = conn.close().await;
             if let Err(err) = &result {
                 debug!(user = user.id, error = %err, "udp relay ended with error");
             }
@@ -215,10 +228,11 @@ async fn connect_tcp(destination: &Socksaddr, outbound: Option<SocketAddr>) -> i
             None => TcpStream::connect((destination.host()?.as_ref(), destination.port)).await?,
         },
         Some(local_addr) => {
-            let remote = resolve_destination(destination, local_addr.is_ipv4()).await?;
-            let socket = if local_addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
-            socket.bind(with_zero_port(local_addr))?;
-            socket.connect(remote).await?
+            let addresses = match destination.socket_addr() {
+                Some(address) => vec![address],
+                None => lookup_host((destination.host()?.as_ref(), destination.port)).await?.collect(),
+            };
+            connect_bound_tcp(local_addr, addresses).await?
         }
     };
     let conn = TcpConn::new(stream)?;
@@ -234,47 +248,37 @@ fn with_zero_port(address: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn resolve_destination(destination: &Socksaddr, ipv4: bool) -> io::Result<SocketAddr> {
-    if let Some(addr) = destination.socket_addr() {
-        return if addr.is_ipv4() == ipv4 {
-            Ok(addr)
-        } else {
-            Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "destination and node IP address families differ"))
-        };
+async fn connect_bound_tcp(
+    local: SocketAddr,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> io::Result<TcpStream> {
+    let mut last_error = io::Error::new(io::ErrorKind::AddrNotAvailable, "no destination matching the node IP family");
+    for remote in addresses.into_iter().filter(|address| address.is_ipv4() == local.is_ipv4()) {
+        let socket = if local.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+        socket.bind(with_zero_port(local))?;
+        match socket.connect(remote).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = err,
+        }
     }
-    lookup_host((destination.host()?.as_ref(), destination.port)).await?.find(|addr| addr.is_ipv4() == ipv4).ok_or_else(
-        || io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS returned no address matching the node IP family"),
-    )
+    Err(last_error)
 }
 
 /// UDP relay with a single association socket.
 async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>, outbound: Option<SocketAddr>) -> io::Result<()> {
-    // Use an unconnected socket and track the last destination. Snell UDP
-    // tunnels are request/response pairs in practice; replies from any of
-    // the destinations in the tunnel are forwarded back to the client.
     let bind_address = outbound.map(with_zero_port).unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
-    let socket = Arc::new(UdpSocket::bind(bind_address).await?);
-    let downlink = {
-        let socket = socket.clone();
-        let conn = conn.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let (n, addr) = match socket.recv_from(&mut buf).await {
-                    Ok(read) => read,
-                    Err(_) => return,
-                };
-                state.acquire_all(false, n as u64).await;
-                let buffer = Buffer::from_slice_with_headroom(&buf[..n], conn.front_headroom(), conn.rear_headroom());
-                if conn.write_packet(buffer, Socksaddr::from(addr)).await.is_err() {
-                    return;
-                }
-                state.record_download(n as u64);
-            }
-        })
+    let socket = UdpSocket::bind(bind_address).await?;
+    let downlink = async {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let (n, addr) = socket.recv_from(&mut buf).await?;
+            state.acquire_all(false, n as u64).await;
+            let buffer = Buffer::from_slice_with_headroom(&buf[..n], conn.front_headroom(), conn.rear_headroom());
+            conn.write_packet(buffer, Socksaddr::from(addr)).await?;
+            state.record_download(n as u64);
+        }
     };
-    let result = async {
+    let uplink = async {
         loop {
             let mut buffer = Buffer::new_packet();
             let destination = conn.read_packet(&mut buffer).await?;
@@ -287,9 +291,10 @@ async fn relay_udp(conn: Arc<dyn PacketConn>, state: Arc<UserState>, outbound: O
                 state.record_upload(sent as u64);
             }
         }
-    }
-    .await;
-    downlink.abort();
+    };
+    // Keep both directions in the owning task so cancellation drops the UDP
+    // socket and cannot leave an unmetered downlink running after shutdown.
+    let result = tokio::select! { result = uplink => result, result = downlink => result };
     let _ = conn.close().await;
     result
 }
@@ -312,6 +317,35 @@ fn _assert_object_safe(_: &dyn Handler) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bound_tcp_retries_addresses_without_changing_source_ip() {
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_address = refused.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        drop(refused);
+        let stream = connect_bound_tcp(
+            "127.0.0.1:0".parse().unwrap(),
+            ["[::1]:1".parse().unwrap(), refused_address, listener.local_addr().unwrap()],
+        )
+        .await
+        .unwrap();
+        let (_, peer) = listener.accept().await.unwrap();
+        assert_eq!("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), peer.ip());
+        assert_eq!(listener.local_addr().unwrap(), stream.peer_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bound_tcp_rejects_other_families_and_returns_connection_failures() {
+        let local = "127.0.0.1:0".parse().unwrap();
+        let err = connect_bound_tcp(local, ["[::1]:1".parse().unwrap()]).await.unwrap_err();
+        assert_eq!(io::ErrorKind::AddrNotAvailable, err.kind());
+        let refused = tokio::net::TcpListener::bind(local).await.unwrap();
+        let refused_address = refused.local_addr().unwrap();
+        drop(refused);
+        let err = connect_bound_tcp(local, [refused_address]).await.unwrap_err();
+        assert_eq!(io::ErrorKind::ConnectionRefused, err.kind());
+    }
     use crate::accounting::Registry;
     use crate::config::Traffic;
     use std::time::Duration;
@@ -339,8 +373,15 @@ mod tests {
     #[test]
     fn authorize_requires_authenticated_user() {
         let (registry, counters) = registry_with_user();
-        let handler =
-            RelayHandler { registry: registry.clone(), counters, enforce_quota: true, quota_grace: 0, outbound: None };
+        let handler = RelayHandler {
+            registry: registry.clone(),
+            counters,
+            enforce_quota: true,
+            quota_grace: 0,
+            outbound: None,
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
         let ctx = Context::new();
         assert!(handler.authorize(&ctx, &Socksaddr::parse_host_port("1.2.3.4", 1000)).is_none());
         let user = handler.registry.spec(7).unwrap();
@@ -362,7 +403,15 @@ mod tests {
             upload: 100,
             download: 0,
         }]);
-        let handler = RelayHandler { registry, counters, enforce_quota: true, quota_grace: 0, outbound: None };
+        let handler = RelayHandler {
+            registry,
+            counters,
+            enforce_quota: true,
+            quota_grace: 0,
+            outbound: None,
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
         let user = handler.registry.spec(7).unwrap();
         let ctx = Context::new().with_user(entry(user));
         assert!(handler.authorize(&ctx, &Socksaddr::parse_host_port("1.2.3.4", 1)).is_none());

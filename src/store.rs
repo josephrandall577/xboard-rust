@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use tracing::{info, warn};
 
-use crate::config::{User, UserSpec};
+use crate::config::{Traffic, User, UserSpec};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -61,6 +61,11 @@ impl Store {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 upload INTEGER NOT NULL DEFAULT 0,
                 download INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS pending_traffic (
+                user_id INTEGER PRIMARY KEY,
+                upload INTEGER NOT NULL CHECK(upload >= 0 AND typeof(upload) = 'integer'),
+                download INTEGER NOT NULL CHECK(download >= 0 AND typeof(download) = 'integer')
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -225,6 +230,60 @@ impl Store {
         })
     }
 
+    /// Atomically persists local usage and the deltas still owed to the panel.
+    pub fn stage_traffic(&self, deltas: &[(i64, Traffic)]) -> Result<(), StoreError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            for (id, traffic) in deltas {
+                let (upload, download) = sqlite_traffic(traffic)?;
+                tx.execute(
+                    "UPDATE users SET upload = upload + ?2, download = download + ?3 WHERE id = ?1",
+                    params![id, upload, download],
+                )?;
+                tx.execute(
+                    "INSERT INTO pending_traffic (user_id, upload, download) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                     upload = upload + excluded.upload, download = download + excluded.download",
+                    params![id, upload, download],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn pending_traffic(&self) -> Result<Vec<(i64, Traffic)>, StoreError> {
+        self.with_conn(|conn| {
+            let mut statement =
+                conn.prepare("SELECT user_id, upload, download FROM pending_traffic ORDER BY user_id")?;
+            let rows = statement.query_map([], |row| {
+                // The outbox CHECK constraints guarantee nonnegative i64 values.
+                Ok((
+                    row.get(0)?,
+                    Traffic { upload: row.get::<_, i64>(1)? as u64, download: row.get::<_, i64>(2)? as u64 },
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        })
+    }
+
+    /// Removes only the delivered snapshot, retaining bytes staged since it was read.
+    pub fn acknowledge_traffic(&self, delivered: &[(i64, Traffic)]) -> Result<(), StoreError> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction()?;
+            for (id, traffic) in delivered {
+                let (upload, download) = sqlite_traffic(traffic)?;
+                tx.execute(
+                    "UPDATE pending_traffic SET upload = upload - ?2, download = download - ?3 WHERE user_id = ?1",
+                    params![id, upload, download],
+                )?;
+            }
+            tx.execute("DELETE FROM pending_traffic WHERE upload = 0 AND download = 0", [])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn reset_traffic(&self, id: Option<i64>) -> Result<usize, StoreError> {
         self.with_conn(|conn| match id {
             Some(id) => Ok(conn.execute("UPDATE users SET upload = 0, download = 0 WHERE id = ?1", [id])?),
@@ -271,6 +330,14 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn sqlite_traffic(traffic: &Traffic) -> Result<(i64, i64), StoreError> {
+    let upload =
+        i64::try_from(traffic.upload).map_err(|_| StoreError::Invalid("upload exceeds SQLite integer range".into()))?;
+    let download = i64::try_from(traffic.download)
+        .map_err(|_| StoreError::Invalid("download exceeds SQLite integer range".into()))?;
+    Ok((upload, download))
 }
 
 fn row_to_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use snell::{Conn, Context, Service, Socksaddr, TcpConn, v6};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use crate::accounting::Registry;
@@ -19,6 +20,7 @@ pub struct SnellServer {
     registry: Arc<Registry>,
     cancel: CancellationToken,
     local_addr: std::net::SocketAddr,
+    tasks: TaskTracker,
 }
 
 impl SnellServer {
@@ -32,8 +34,17 @@ impl SnellServer {
         outbound: Option<SocketAddr>,
     ) -> io::Result<SnellServer> {
         let mode = v6::parse_mode(&config.node.mode)?;
-        let handler: Arc<dyn snell::Handler> =
-            Arc::new(RelayHandler { registry: registry.clone(), counters, enforce_quota, quota_grace, outbound });
+        let cancel = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let handler: Arc<dyn snell::Handler> = Arc::new(RelayHandler {
+            registry: registry.clone(),
+            counters,
+            enforce_quota,
+            quota_grace,
+            outbound,
+            cancel: cancel.clone(),
+            tasks: tasks.clone(),
+        });
         let service = v6::MultiService::<crate::relay::AuthedUser>::new(v6::ServerOptions {
             psk: config.node.psk.as_bytes().to_vec(),
             mode,
@@ -46,11 +57,11 @@ impl SnellServer {
         let local = listener.local_addr()?;
         info!(%local, mode = %mode, users = users.len(), "snell v6 listener started");
 
-        let cancel = CancellationToken::new();
         {
             let cancel = cancel.clone();
             let service = service.clone();
-            tokio::spawn(async move {
+            let connection_tasks = tasks.clone();
+            tasks.spawn(async move {
                 loop {
                     let (stream, addr) = tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -68,11 +79,17 @@ impl SnellServer {
                     };
                     let conn: Arc<dyn Conn> = Arc::new(conn);
                     let service = service.clone();
-                    tokio::spawn(async move {
+                    let cancel = cancel.clone();
+                    connection_tasks.spawn(async move {
                         let source = Socksaddr::from(addr);
-                        if let Err(err) = service.new_connection(Context::new(), conn.clone(), source, None).await {
-                            let _ = err.conn.close().await;
-                            debug!(error = %err, "snell connection failed");
+                        tokio::select! {
+                            _ = cancel.cancelled() => { let _ = conn.close().await; }
+                            result = service.new_connection(Context::new(), conn.clone(), source, None) => {
+                                if let Err(err) = result {
+                                    let _ = err.conn.close().await;
+                                    debug!(error = %err, "snell connection failed");
+                                }
+                            }
                         }
                     });
                 }
@@ -80,7 +97,7 @@ impl SnellServer {
             })
         };
 
-        Ok(SnellServer { service, registry, cancel, local_addr: local })
+        Ok(SnellServer { service, registry, cancel, local_addr: local, tasks })
     }
 
     /// Replaces the accepted user set without restarting the listener.
@@ -97,9 +114,15 @@ impl SnellServer {
         self.local_addr
     }
 
-    /// Stops accepting connections.
+    /// Stops the listener and cancels active handshakes and relays.
     pub fn stop(&self) {
         self.cancel.cancel();
+        self.tasks.close();
+    }
+
+    /// Waits until the listener, handshakes and metered relays have stopped.
+    pub async fn wait(&self) {
+        self.tasks.wait().await;
     }
 }
 
@@ -161,6 +184,8 @@ mod tests {
                 enforce_quota: true,
                 quota_grace: 0,
                 outbound: None,
+                cancel: CancellationToken::new(),
+                tasks: TaskTracker::new(),
             }),
         })
         .unwrap();

@@ -361,6 +361,35 @@ impl Registry {
             .collect()
     }
 
+    /// Commits a pending snapshot and advances the registry's persisted usage
+    /// under the same lock, keeping quota checks valid after the drain.
+    pub(crate) fn persist_pending<E>(&self, persist: impl FnOnce(&[(i64, Traffic)]) -> Result<(), E>) -> Result<(), E> {
+        let mut inner = self.inner.lock().unwrap();
+        let deltas: Vec<_> = inner
+            .users
+            .iter()
+            .filter_map(|(&id, state)| {
+                let traffic = state.take_pending();
+                (!traffic.is_zero()).then_some((id, traffic))
+            })
+            .collect();
+        if let Err(err) = persist(&deltas) {
+            for (id, delta) in &deltas {
+                if let Some(state) = inner.users.get(id) {
+                    state.restore_pending(*delta);
+                }
+            }
+            return Err(err);
+        }
+        for (id, delta) in deltas {
+            if let Some(user) = inner.specs.get_mut(&id) {
+                user.upload = user.upload.saturating_add(delta.upload);
+                user.download = user.download.saturating_add(delta.download);
+            }
+        }
+        Ok(())
+    }
+
     /// Bytes used by a user, including deltas not yet flushed to the store.
     ///
     /// The store only knows flushed bytes; the registry's cumulative totals
