@@ -73,13 +73,15 @@ fetch() {
 }
 
 main() {
-    local config_source= option target archive_name archive_root base expected filename
+    local config_source='' option target archive_name archive_root base expected filename
     while (($#)); do
         option=$1
         case "$option" in
             -h|--help) usage; return ;;
             --version|--download-url|--panel-url|--panel-token|--node-id|--psk|--listen|--api-version|--config)
-                (($# >= 2)) && [[ -n "$2" ]] || fail "$option requires a value"
+                if (($# < 2)) || [[ -z "$2" ]]; then
+                    fail "$option requires a value"
+                fi
                 case "$option" in
                     --version) VERSION=$2 ;;
                     --download-url) DOWNLOAD_URL=$2 ;;
