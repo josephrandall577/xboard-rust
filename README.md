@@ -46,11 +46,14 @@ A Git tag push alone does not publish binaries.
 | Windows | ARM64 | `aarch64-pc-windows-msvc.zip` |
 
 Assets are named `xboard-snell-<release-tag>-<target>.<archive-type>`.
-Each archive contains the executable, both single-node and multi-node TOML
-examples, the installer, the systemd unit, this README and the license.
+Newly built archives contain the executable, both single-node and multi-node TOML
+examples, the installer, the systemd unit, this README and the license. Existing
+v1.1.1 and v1.1.0 archives predate the installer and systemd packaging; the public
+site supplies their installer and service unit as verified companion files. Those
+binaries also predate the panel-only changes in this checkout.
 Windows binaries statically link the MSVC runtime. macOS binaries are unsigned.
 
-Download the matching archive from [Releases](https://github.com/josephrandall577/xboard-snell/releases),
+Download the matching archive from the public [download site](https://assets.nowhere.best/),
 extract it, copy `config.example.toml` to `config.toml`, and edit the panel
 settings and server PSK. On Linux/macOS:
 
@@ -165,8 +168,7 @@ when those releases leave the retained set. Publishing a stable Release triggers
 the site workflow after all binaries are attached. The workflow summary includes
 public installer, metadata and all six platform download links. A missing
 Cloudflare credential fails publication with an explicit configuration error.
-Prereleases and ordinary
-source pushes do not update the public stable download. Maintainers can also run
+Prereleases and ordinary source pushes do not update the public stable download. Maintainers can also run
 **Actions → Publish download site → Run workflow** with a specific stable tag.
 
 Initial setup in the private GitHub repository:
