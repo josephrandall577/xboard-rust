@@ -30,3 +30,14 @@ This module pins the Go implementation this crate was ported from
   VECTORS_OUT=/path/to/tests/fixtures/v6_vectors.txt go test -run TestDumpVectors ./snellv6/
   VECTORS_OUT=/path/to/tests/fixtures/v6_wire_shape.txt go test -run TestDumpWireShape ./snellv6/
   ```
+
+* `suite/multi_psk_test.go` exercises the XBoard node with independent Go v6
+  clients on a single port, including empty client IDs, a forged client ID,
+  TCP/UDP payloads and exact per-PSK traffic reports to a local mock panel.
+  From this directory, after building the root node:
+
+  ```sh
+  XBOARD_SNELL_BIN=$PWD/../../target/debug/xboard-snell go test ./suite -run TestV6MultiPskNode
+  ```
+
+  CI sets this alongside `SNELL_SERVER_BIN`; without it the node test is skipped.

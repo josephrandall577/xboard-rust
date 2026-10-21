@@ -183,7 +183,8 @@ impl PanelClient {
 
     pub async fn fetch_users(&self) -> Result<Vec<UserSpec>, PanelError> {
         let value = self.get_json(self.user_path()).await?;
-        let users = value.get("users").cloned().unwrap_or(Value::Array(Vec::new()));
+        let users =
+            value.get("users").cloned().ok_or_else(|| PanelError::Decode("missing users in panel response".into()))?;
         let users: Vec<PanelUser> = serde_json::from_value(users).map_err(|err| PanelError::Decode(err.to_string()))?;
         Ok(users.into_iter().map(Into::into).collect())
     }

@@ -256,8 +256,7 @@ async fn shutdown_closes_active_relays_before_final_accounting() {
     server.update_users(&node.store.list_users().unwrap()).unwrap();
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = v6::Client::new(v6::ClientOptions {
-        psk: node.config.node.psk.as_bytes().to_vec(),
-        user_key: user().uuid.into_bytes(),
+        psk: user().uuid.into_bytes(),
         mode: v6::parse_mode(&node.config.node.mode).unwrap(),
         server: Socksaddr::from(server.local_addr()),
         ..Default::default()
@@ -316,8 +315,7 @@ async fn shutdown_closes_udp_association_before_final_accounting() {
     server.update_users(&node.store.list_users().unwrap()).unwrap();
     let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = v6::Client::new(v6::ClientOptions {
-        psk: node.config.node.psk.as_bytes().to_vec(),
-        user_key: user().uuid.into_bytes(),
+        psk: user().uuid.into_bytes(),
         mode: v6::parse_mode(&node.config.node.mode).unwrap(),
         server: server.local_addr().into(),
         ..Default::default()

@@ -3,10 +3,9 @@
 [node]
 # Snell v6 listener. The client's Snell server line points here.
 listen = "0.0.0.0:6160"
-# Pre-shared key every client must know. 12..=255 bytes.
-psk = "change-me-to-a-long-random-psk"
-# v6 record mode: "default", "unshaped" or "unsafe-raw".
-# "default" is the shaped mode Surge 6.x uses by default.
+# Clients use their own Xboard user UUID as PSK (unique, 12..=255 bytes).
+# Legacy node.psk is optional and ignored. No client userkey is needed.
+# Per-user PSK identification requires the default shaped mode.
 mode = "default"
 
 [panel]

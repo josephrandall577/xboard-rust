@@ -77,15 +77,19 @@ jobs:
           cache-dependency-path: snell/interop/go.sum
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: snell
+          workspaces: |
+            .
+            snell
       - name: Build both reference wrappers
         run: |
+          cargo build --locked
           cargo build --manifest-path snell/Cargo.toml --locked --example snell-server
           go -C snell/interop build -o "$RUNNER_TEMP/go-snell-server" ./snell-server
       - name: Go clients against Rust server
         working-directory: snell/interop
         env:
           SNELL_SERVER_BIN: ${{ github.workspace }}/snell/target/debug/examples/snell-server
+          XBOARD_SNELL_BIN: ${{ github.workspace }}/target/debug/xboard-snell
         run: go test -count=1 -timeout 10m ./...
       - name: Rust clients against Go server
         env:

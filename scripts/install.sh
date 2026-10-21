@@ -30,7 +30,7 @@ An existing config and database are preserved when upgrading.
   --panel-url URL      Xboard URL (also PANEL_URL)
   --panel-token TOKEN  Panel token (prefer PANEL_TOKEN environment variable)
   --node-id ID         Panel node ID (also NODE_ID)
-  --psk KEY            Server PSK; generated if omitted (also SNELL_PSK)
+  --psk KEY            Legacy shared PSK for older releases (also SNELL_PSK)
   --listen IP:PORT     Snell listener (also SNELL_LISTEN; default 0.0.0.0:6160)
   --api-version 1|2    Panel API version (also API_VERSION; default 2)
   --config PATH       Copy this existing panel TOML on first install
@@ -202,7 +202,8 @@ main() {
     log "Installed $VERSION. Config: $CONFIG_FILE"
     log 'Service: systemctl status xboard-snell --no-pager'
     log 'Logs: journalctl -u xboard-snell -f'
-    log 'Server PSK is stored in [node].psk in the config file.'
+    log 'Current builds: clients use their own panel user UUID as PSK (Snell v6 default mode).'
+    log 'Older releases: legacy shared PSK is stored in [node].psk.'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

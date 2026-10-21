@@ -189,16 +189,13 @@ impl Namespaces {
             ^ (a as u64).wrapping_mul(DOMAIN_MUL).wrapping_add(0xb57de1f3f82cb33f)
             ^ (label as u64).wrapping_mul(0xa24baed4963ee407)
             ^ (output.len() as u64).wrapping_mul(0x165667b19e3779f9).wrapping_add(0x0d4cd3e7b14a36d7);
-        let mut offset = 0;
-        while offset < output.len() {
+        let mut output = output;
+        while !output.is_empty() {
             seed = seed.wrapping_add(GOLDEN_GAMMA);
-            let block = splitmix64(seed);
-            let mut shift = 0;
-            while shift < 64 && offset < output.len() {
-                output[offset] = (block >> shift) as u8;
-                offset += 1;
-                shift += 8;
-            }
+            let block = splitmix64(seed).to_le_bytes();
+            let n = output.len().min(8);
+            output[..n].copy_from_slice(&block[..n]);
+            output = &mut output[n..];
         }
     }
 
@@ -623,6 +620,14 @@ impl Profile {
                 salt_mask(self.namespaces.salt, self.mix_stride_handshake as u8, i as u32) ^ block[perm[i] as usize];
         }
         out
+    }
+
+    /// Deterministic bytes of the first salt block; shuffled salt bytes are omitted.
+    pub(crate) fn salt_fingerprint(&self) -> Vec<(usize, u8)> {
+        let mut block = vec![0; self.salt_block_len];
+        self.fill_padding(u32::MAX, &mut block);
+        let perm = shuffle_perm(self.namespaces.salt, self.mix_rounds_handshake as u8, block.len());
+        block.into_iter().enumerate().filter(|(i, _)| !perm[..SALT_LEN].contains(&(*i as u8))).collect()
     }
 
     pub(crate) fn write_salt_block(&self, salt: &[u8], block: &mut [u8]) {

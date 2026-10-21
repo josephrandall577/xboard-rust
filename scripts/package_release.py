@@ -43,9 +43,14 @@ def main():
             ("scripts/install.sh", "scripts/install.sh"),
             ("systemd/xboard-snell.service", "systemd/xboard-snell.service"),
             ("snell/LICENSE", "LICENSE"),
+            ("snell/UPSTREAM.md", "snell/UPSTREAM.md"),
+            ("docs/multi-psk-validation.md", "docs/multi-psk-validation.md"),
         ]:
             (staging / destination).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / source, staging / destination)
+        release_notes = root / f"RELEASE_NOTES_{args.version}.md"
+        if release_notes.is_file():
+            shutil.copy2(release_notes, staging / release_notes.name)
         if windows:
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
                 for member in sorted(staging.rglob("*")):

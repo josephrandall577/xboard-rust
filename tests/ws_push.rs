@@ -29,8 +29,8 @@ async fn handle(mut socket: WebSocket) {
     let event = json!({
         "event": "sync.users",
         "data": {"users": [
-            {"id": 1, "uuid": "alice-key", "speed_limit": 128, "device_limit": 2},
-            {"id": 2, "uuid": "bob-key", "speed_limit": null, "device_limit": null,
+            {"id": 1, "uuid": "alice-key-unique-psk", "speed_limit": 128, "device_limit": 2},
+            {"id": 2, "uuid": "bob-key-unique-psk", "speed_limit": null, "device_limit": null,
              "transfer_enable": 1024, "expired_at": 123, "enabled": false}
         ]}
     });
@@ -68,7 +68,7 @@ async fn sync_users_event_updates_store() {
 
     let users = store.list_users().unwrap();
     assert_eq!(2, users.len());
-    assert_eq!("alice-key", users[0].uuid);
+    assert_eq!("alice-key-unique-psk", users[0].uuid);
     assert_eq!(128, users[0].speed_limit);
     assert_eq!(2, users[0].device_limit);
     assert_eq!(0, users[1].speed_limit);

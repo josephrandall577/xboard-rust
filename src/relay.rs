@@ -42,7 +42,11 @@ impl RelayHandler {
         if self.counters.is_shutting_down() {
             return None;
         }
-        let user = ctx.user::<AuthedUser>()?.user.clone();
+        let authenticated = &ctx.user::<AuthedUser>()?.user;
+        let user = self.registry.user_by_key(authenticated.key())?;
+        if user.id != authenticated.id {
+            return None;
+        }
         let state = self.registry.state(user.id)?;
         if self.enforce_quota && user.transfer_enable > 0 {
             let used = self.registry.used_bytes(user.id).unwrap_or(0);

@@ -1,29 +1,19 @@
-.PHONY: fmt lint test test_official xboard_node_test xboard_node_lint interop interop_go_suite interop_rust_client
+.PHONY: fmt lint test test_official interop interop_go_suite interop_rust_client
 
 SNELL_SERVER_RUST = target/release/examples/snell-server
 SNELL_SERVER_GO = target/interop/go-snell-server
 
-XBOARD_NODE = xboard-node
-
 fmt:
 	cargo fmt
-	cd $(XBOARD_NODE) && cargo fmt
 	cd interop && gofmt -w .
 
-lint: xboard_node_lint
+lint:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 	cd interop && go vet ./...
 
-xboard_node_lint:
-	cd $(XBOARD_NODE) && cargo fmt --check
-	cd $(XBOARD_NODE) && cargo clippy --all-targets -- -D warnings
-
-test: xboard_node_test
+test:
 	cargo test
-
-xboard_node_test:
-	cd $(XBOARD_NODE) && cargo test
 
 # Runs tests/official.rs against the official snell-server binaries in Docker.
 test_official:

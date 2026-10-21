@@ -30,7 +30,7 @@ pub struct ServerOptions {
 pub(crate) struct ServiceInner {
     pub(crate) framing: Framing,
     pub(crate) handler: Arc<dyn Handler>,
-    authenticator: Option<Box<Authenticator>>,
+    pub(crate) authenticator: Option<Box<Authenticator>>,
 }
 
 pub(crate) fn err_invalid_udp_tunnel_request() -> io::Error {
@@ -162,11 +162,23 @@ impl ServiceInner {
         source: Socksaddr,
         on_close: Option<CloseHandler>,
     ) -> io::Result<()> {
-        let (reader, mut record) = self
+        let (reader, record) = self
             .framing
             .read_first_record(&conn, ReadWaitOptions::default())
             .await
             .map_err(|err| error::cause(err, "read request"))?;
+        self.serve_record(ctx, conn, source, on_close, reader, record).await
+    }
+
+    pub(crate) async fn serve_record(
+        self: &Arc<Self>,
+        ctx: Context,
+        conn: Arc<dyn Conn>,
+        source: Socksaddr,
+        on_close: Option<CloseHandler>,
+        reader: Arc<dyn RecordReader>,
+        mut record: Buffer,
+    ) -> io::Result<()> {
         let request = read_server_request(&mut record).map_err(|err| error::cause(err, "decode request"))?;
 
         match request.command {

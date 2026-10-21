@@ -911,3 +911,39 @@ async fn conn_stream_copy_bidirectional() {
     assert!(received == payload, "payload mismatch");
     copy.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_psk_reuses_one_transport_and_rechecks_revocation() {
+    let echo_port = start_tcp_echo().await;
+    let destination = Socksaddr::parse_host_port("127.0.0.1", echo_port);
+    let psk = b"independent-user-psk".to_vec();
+    let service = Arc::new(v6::MultiPskService::<usize>::new(v6::Mode::Default, Arc::new(LocalRouteHandler)).unwrap());
+    service.update_users(vec![1], vec![psk.clone()]).unwrap();
+    let address = start_local_snell_service(service.clone()).await;
+    let proxy = CountingTcpProxy::start(address).await;
+    let client = v6::Client::new(v6::ClientOptions {
+        psk,
+        reuse: true,
+        dialer: system_dialer(),
+        server: proxy.socksaddr(),
+        ..Default::default()
+    })
+    .unwrap();
+    for label in ["first-logical-request", "second-logical-request"] {
+        ReuseScenario { client: &client, destination: destination.clone() }.round_trip(label).await;
+    }
+    assert_eq!(1, proxy.count(), "logical requests must share a transport");
+    service.update_users(vec![], vec![]).unwrap();
+    let conn = client.dial_context(&Context::new(), destination).await.unwrap();
+    conn.set_deadline(deadline(3)).unwrap();
+    let result = async {
+        conn.write(b"revoked").await?;
+        let mut reply = [0; 7];
+        read_full(conn.as_ref(), &mut reply).await
+    }
+    .await;
+    assert!(result.is_err(), "revoked credential must not authorize a reused request");
+    assert_eq!(1, proxy.count());
+    let _ = conn.close().await;
+    client.close().await.unwrap();
+}

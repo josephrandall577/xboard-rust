@@ -1,11 +1,11 @@
 # One process, independently accounted Xboard nodes.
+# Each client uses its own panel user UUID as PSK; only default mode is supported.
 # Every listen IP must already be assigned to this host and unique across nodes.
 # TCP and UDP destination sockets use the matching node listen IP as their source.
 
 [[nodes]]
 name = "edge-a"
 listen = "192.0.2.10:6160"
-psk = "replace-with-a-unique-16-byte-key-a"
 mode = "default"
 
 [nodes.panel]
@@ -24,7 +24,6 @@ disabled = false
 [[nodes]]
 name = "edge-b"
 listen = "192.0.2.11:6160"
-psk = "replace-with-a-unique-16-byte-key-b"
 mode = "default"
 
 [nodes.panel]

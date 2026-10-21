@@ -266,13 +266,14 @@ async fn apply_users(
     users: Vec<crate::config::User>,
 ) {
     let count = users.len();
-    registry.apply_users(&users);
     let guard = server.read().await;
     if let Some(server) = guard.as_ref()
         && let Err(err) = server.update_users(&users)
     {
         warn!(error = %err, "failed to apply users to listener");
+        return;
     }
+    registry.apply_users(&users);
     debug!(users = count, "user set applied");
 }
 
@@ -302,6 +303,10 @@ async fn pull_loop(
         }
         match panel.fetch_users().await {
             Ok(users) => {
+                if let Err(err) = crate::config::validate_user_psks(&users) {
+                    warn!(error = %err, "invalid panel credentials; keeping previous user set");
+                    continue;
+                }
                 if let Err(err) = store.replace_users(&users) {
                     warn!(error = %err, "failed to store panel users");
                     continue;

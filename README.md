@@ -1,17 +1,24 @@
 # xboard-snell
 
-An Xboard-compatible Snell v6 landing server built on the vendored
-[`snell`](snell/) crate (the Rust port of sing-snell).
+Current release: **v2.0.0**. This major release switches client authentication to
+independent per-user PSKs. Read the [migration notes](RELEASE_NOTES_v2.0.0.md) before upgrading.
 
-The node speaks the Snell v6 wire protocol (per-user keys, `default`,
-`unshaped` and `unsafe-raw` modes) and implements the Xboard node backend
+An Xboard-compatible Snell v6 landing server built on the vendored
+[`snell`](snell/) crate from [snell-in-rust](https://github.com/josephrandall577/snell-in-rust),
+aligned to v1.1.2 (`55002dc`). Its protocol implementation originates from
+[SagerNet/sing-snell](https://github.com/SagerNet/sing-snell). See [vendoring notes](snell/UPSTREAM.md).
+
+The node speaks the Snell v6 wire protocol (`default` shaped mode, independent
+per-user PSKs on one listening port) and implements the Xboard node backend
 contract: user sync, traffic accounting, device limits, speed limits,
 quota enforcement, alive-IP reporting and node status/metrics.
 
 ## Features
 
-- **Snell v6**, including per-user keys: the Xboard user `uuid` is the Snell
-  user key, so one listener serves every user with independent credentials.
+- **Snell v6 for Surge**: each Xboard user `uuid` is that user's independent
+  PSK. Surge clients set only `psk` and send no user key. Salt-block fingerprints
+  select a credential; the first AEAD record must verify before it can identify
+  a user. Request `client_id` cannot change the authenticated or billed user.
 - **Traffic accounting** per user and direction, reported to the panel as
   `{uid: [upload, download]}` deltas and persisted locally.
 - **Device limits** by distinct source IP, with a configurable TTL.
@@ -55,7 +62,7 @@ Windows binaries statically link the MSVC runtime. macOS binaries are unsigned.
 
 Download the matching archive from the public [download site](https://assets.nowhere.best/),
 extract it, copy `config.example.toml` to `config.toml`, and edit the panel
-settings and server PSK. On Linux/macOS:
+settings. Current builds use each panel user UUID as the client PSK. On Linux/macOS:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
@@ -85,7 +92,7 @@ sudo bash install.sh
 ~~~
 
 On first install, enter the panel URL, node token and node ID when prompted.
-The script generates a random server PSK, downloads the latest stable binary
+The script generates a legacy server PSK for older releases, downloads the latest stable binary
 for this CPU from the public download site, verifies the archive and companion
 systemd unit against `SHA256SUMS`, validates the configuration, and starts the
 service with boot startup enabled. No GitHub login or token is needed on the
@@ -99,11 +106,14 @@ sudo env PANEL_URL=https://panel.example.com PANEL_TOKEN='your-panel-token' NODE
   bash install.sh --listen 0.0.0.0:6160
 ~~~
 
-Set `SNELL_PSK` to use an existing server PSK. `--api-version 1` selects the
+The installer retains `SNELL_PSK` / `--psk` for older releases; current builds
+ignore the legacy node PSK. `--api-version 1` selects the
 legacy panel API. Run `bash install.sh --help` for all options. The generated
 configuration disables the local admin API; enable it with a token if needed.
-Read the server PSK from `[node].psk` in the installed config and configure the
-matching Snell client server address and port. Allow that listening TCP port in
+For current builds, configure the client with the server address, listening port
+and that user's panel UUID as `psk`, with `version=6` and default shaping.
+Retained v1.1.0/v1.1.1 binaries still use the old shared-PSK/user-key scheme
+and are unsuitable for this Surge authentication flow. Allow that listening TCP port in
 the host/provider firewall.
 
 | Item | Location |
@@ -137,7 +147,7 @@ permissions. Multi-node listening IPs must already be assigned to the host.
 
 ## Public download site on Cloudflare Pages
 
-The private source repository builds releases in GitHub Actions. Only the
+GitHub Actions builds releases from this repository. Only the
 verified binary archives, install script, service unit, public release notes and
 version metadata are copied into the download site. The site builder checks
 all six platforms and archive SHA256 values before writing its output, and
@@ -209,7 +219,7 @@ sudo install -d -m 0750 -o root -g xboard-snell /etc/xboard-snell
 sudo install -d -m 0750 -o xboard-snell -g xboard-snell /var/lib/xboard-snell
 sudo install -m 0755 xboard-snell /usr/local/bin/xboard-snell
 sudo install -m 0640 -o root -g xboard-snell config.example.toml /etc/xboard-snell/config.toml
-# Edit PSK and panel settings before enabling the service:
+# Edit panel settings before enabling the service:
 sudoedit /etc/xboard-snell/config.toml
 sudo install -m 0644 systemd/xboard-snell.service /etc/systemd/system/xboard-snell.service
 sudo systemctl daemon-reload
@@ -227,7 +237,7 @@ health endpoint, if enabled, reports process liveness rather than panel readines
 One process can run several independent panel-backed nodes. Define each node in
 [[nodes]] with a unique name and a distinct, specific local IP address (not a
 wildcard). IPv4-mapped IPv6 listen addresses are rejected; use native IPv4
-or IPv6 addresses. Each node also needs its own listening port, PSK, panel node ID and
+or IPv6 addresses. Each node also needs its own listening port, panel node ID and
 unique management API listen address. TCP and UDP destination sockets bind to
 the same local IP as the corresponding Snell listener. If the requested
 address family or local bind is unavailable, the connection fails rather than
@@ -254,7 +264,7 @@ cargo build --release
 
 ```sh
 cp config.example.toml config.toml
-# edit psk / panel settings
+# edit panel settings
 ./target/release/xboard-snell -c config.toml
 ```
 
@@ -264,8 +274,50 @@ cp config.example.toml config.toml
 
 1. Add a node in Xboard. The backend only needs a token and node id.
 2. Start the node with the matching `[panel]` block.
-3. Point each user's Snell client at `listen` with the server `psk` and the
-   user's `uuid` as the Snell user key.
+3. Point each user's Snell client at `listen`, using that user's `uuid` as
+   `psk`. No user key / `client_id` is needed. For example, a Surge proxy entry:
+
+~~~ini
+MySnell = snell, node.example.com, 6160, psk=YOUR_PANEL_USER_UUID, version=6
+~~~
+
+Each user UUID must be unique and 12–255 bytes long. Only `mode = "default"`
+is accepted. The optional legacy `[node].psk` / `[[nodes]].psk` setting is
+ignored; it grants no access. All client subscriptions must switch from the
+old shared PSK to the individual user's UUID. This node does not generate
+panel subscriptions; ensure the panel's Surge template emits that UUID as PSK.
+
+The selector reads 32 bytes first, then advances in 16-byte steps up to 144 bytes.
+At each step it checks all newly covered salt-block lengths (not only multiples
+of 16), compares the deterministic non-salt bytes, feeds any overread
+record prefix back into the connection, then derives one AEAD key. The fingerprint
+is a selector, not an authentication tag; the payload must pass AEAD verification.
+Do not treat the number of matched bytes as a measured cross-profile collision
+probability: shaped padding is not uniformly random. Handshakes time out after
+10 seconds. Profile/fingerprint state is reused on unchanged user updates.
+
+To measure precomputation, a full 1000-user fingerprint scan of buffered bytes,
+and one Argon2id derivation on the deployment hardware:
+
+~~~sh
+cargo test --manifest-path snell/Cargo.toml --locked --release --lib benchmark_1000_user_psk_selection -- --ignored --nocapture
+~~~
+
+This manual benchmark has no timing pass/fail threshold; it excludes network I/O
+and does not substitute for an end-to-end latency measurement.
+
+A bounded, exact two-generation v6 replay cache retains up to one million
+PSK/salt digests per node. It is updated only after successful first-record AEAD
+verification, survives user updates, and namespaces salts by credential. It is
+in memory: restarting or aging out a generation ends that replay protection
+window. Reused logical requests remain bound to the transport PSK and recheck
+its current user mapping; changing `client_id` cannot switch identities.
+
+Before production rollout, capture a first connection from the actual deployed
+Surge 6.x build and verify the salt fingerprint and TCP/UDP behavior. The repository
+tests use Rust and Go reference clients; they do not establish real-Surge validation.
+See [validation results and the offline Surge capture check](docs/multi-psk-validation.md)
+for measured timings, verification coverage and the remaining production check.
 
 With `api_version = 2` the node calls `POST /api/v2/server/handshake`,
 `GET /api/v2/server/config`, `GET /api/v2/server/user` and

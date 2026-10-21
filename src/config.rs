@@ -70,6 +70,27 @@ fn default_true() -> bool {
     true
 }
 
+/// Reject an invalid full credential snapshot before it reaches storage or the listener.
+pub(crate) fn validate_user_psks(users: &[UserSpec]) -> std::io::Result<()> {
+    let mut keys = std::collections::HashSet::new();
+    let mut ids = std::collections::HashSet::new();
+    for user in users {
+        if !(12..=255).contains(&user.uuid.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("user {} PSK (uuid) must be 12..=255 bytes", user.id),
+            ));
+        }
+        if !keys.insert(&user.uuid) || !ids.insert(user.id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("duplicate user identity or PSK at user {}", user.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl From<UserSpec> for User {
     fn from(spec: UserSpec) -> Self {
         User {
@@ -192,6 +213,7 @@ pub struct Config {
 pub struct ManagedNodeConfig {
     pub name: String,
     pub listen: String,
+    #[serde(default)]
     pub psk: String,
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -204,9 +226,10 @@ pub struct ManagedNodeConfig {
 pub struct NodeConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Server PSK. Must be 12..=255 bytes, like the official server.
+    /// Legacy setting, ignored. Clients use their panel UUID as their PSK.
+    #[serde(default)]
     pub psk: String,
-    /// `default`, `unshaped` or `unsafe-raw`.
+    /// Only `default` supports per-user PSK identification.
     #[serde(default = "default_mode")]
     pub mode: String,
 }
@@ -489,10 +512,10 @@ fn validate_panel(panel: &PanelConfig, name: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_node_credentials(psk: &str, mode: &str) -> Result<(), ConfigError> {
-    if !(12..=255).contains(&psk.len()) {
+    if !psk.is_empty() && !(12..=255).contains(&psk.len()) {
         return Err(ConfigError::InvalidPsk(psk.len()));
     }
-    if snell::v6::parse_mode(mode).is_err() {
+    if snell::v6::parse_mode(mode).ok() != Some(snell::v6::Mode::Default) {
         return Err(ConfigError::InvalidMode(mode.to_string()));
     }
     Ok(())
@@ -524,7 +547,7 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidPsk(len) => {
                 write!(f, "psk must be 12..=255 bytes long (got {len})")
             }
-            ConfigError::InvalidMode(mode) => write!(f, "unknown snell v6 mode: {mode}"),
+            ConfigError::InvalidMode(mode) => write!(f, "per-user PSKs require snell v6 default mode (got {mode})"),
             ConfigError::MissingPanel => {
                 write!(f, "panel configuration is required; standalone mode is no longer supported")
             }
@@ -638,9 +661,18 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml");
         let mut config = Config::load(path).expect("example config must parse");
         assert_eq!("default", config.node.mode);
-        assert!(config.node.psk.len() >= 12);
+        assert!(config.node.psk.is_empty());
         config.panel = None;
         assert!(matches!(config.validate(), Err(ConfigError::MissingPanel)));
+    }
+
+    #[test]
+    fn nodes_reject_modes_without_psk_fingerprints() {
+        let mut config = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml")).unwrap();
+        for mode in ["unshaped", "unsafe-raw", "invalid"] {
+            config.node.mode = mode.into();
+            assert!(matches!(config.validate(), Err(ConfigError::InvalidMode(_))));
+        }
     }
 
     #[test]

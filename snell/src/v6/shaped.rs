@@ -17,6 +17,9 @@ use crate::net::{self, Conn, ReadWaitOptions, unix_now};
 use crate::reuse::{BaseReader, RecordSource, RecordWriter};
 use crate::{AEAD_TAG_LEN, HEADER_CIPHER_LEN, HEADER_PLAIN_LEN, HEADER_VERSION, NONCE_LEN};
 
+/// The profile derivation caps record prefixes at 0x80 bytes.
+const MAX_RECORD_PREFIX: usize = 0x80;
+
 struct ShapedState {
     cipher: Aead,
     salt: [u8; SALT_LEN],
@@ -139,6 +142,9 @@ impl ShapedWriter {
     async fn write_records(&self, records: Vec<Buffer>) -> io::Result<()> {
         if records.len() == 1 {
             return self.upstream.write(records[0].bytes()).await.map(|_| ());
+        }
+        if self.upstream.supports_vectorised() {
+            return self.upstream.write_vectorised(records).await;
         }
         let mut out = Buffer::with_capacity(records.iter().map(Buffer::len).sum());
         for record in &records {
@@ -317,6 +323,22 @@ pub(crate) fn new_shaped_reader(upstream: Arc<dyn Conn>, psk: Arc<[u8]>, profile
     })
 }
 
+/// Starts at the encrypted header after the salt block has been consumed.
+pub(crate) fn new_shaped_reader_with_salt(
+    upstream: Arc<dyn Conn>,
+    psk: Arc<[u8]>,
+    profile: Arc<Profile>,
+    salt: &[u8; SALT_LEN],
+) -> io::Result<ShapedReader> {
+    let cipher = Aead::new(&derive_key(&psk, salt))?;
+    Ok(BaseReader::new(ShapedSource {
+        upstream,
+        psk,
+        profile,
+        state: Mutex::new(ShapedReaderState { cipher: Some(cipher), nonce: [0; NONCE_LEN], seq: 0 }),
+    }))
+}
+
 struct ShapedReaderState {
     cipher: Option<Aead>,
     nonce: Nonce,
@@ -346,8 +368,10 @@ impl RecordSource for ShapedSource {
         let cipher = state.cipher.as_ref().unwrap();
 
         let prefix_len = profile.record_prefix_len(state.seq);
-        let mut head = vec![0u8; prefix_len + HEADER_CIPHER_LEN];
-        net::read_full(upstream, &mut head).await?;
+        debug_assert!(prefix_len <= MAX_RECORD_PREFIX);
+        let mut head = [0u8; MAX_RECORD_PREFIX + HEADER_CIPHER_LEN];
+        let head = &mut head[..prefix_len + HEADER_CIPHER_LEN];
+        net::read_full(upstream, head).await?;
         let (prefix, header) = head.split_at_mut(prefix_len);
         cipher.open_in_place(&state.nonce, prefix, header).map_err(|err| error::cause(err, "open shaped header"))?;
         increase_nonce(&mut state.nonce);

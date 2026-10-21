@@ -523,6 +523,7 @@ pub struct TcpConn {
     close_once: AtomicBool,
     read_deadline: watch::Sender<Option<Instant>>,
     write_deadline: watch::Sender<Option<Instant>>,
+    read_options: Mutex<ReadWaitOptions>,
     local: Socksaddr,
     remote: Socksaddr,
 }
@@ -550,6 +551,7 @@ impl TcpConn {
             close_once: AtomicBool::new(false),
             read_deadline: watch::Sender::new(None),
             write_deadline: watch::Sender::new(None),
+            read_options: Mutex::new(ReadWaitOptions::default()),
             local,
             remote,
         })
@@ -577,8 +579,24 @@ impl TcpConn {
 
     async fn write_slices(&self, slices: &mut [IoSlice<'_>]) -> io::Result<()> {
         let mut slices = slices;
-        IoSlice::advance_slices(&mut slices, 0);
         let mut deadline_rx = self.write_deadline.subscribe();
+        // Writes are usually ready; try them without arming the deadline and
+        // close watchers first.
+        while !slices.is_empty() {
+            self.check(*deadline_rx.borrow_and_update())?;
+            let count = slices.len().min(MAX_IOV);
+            let result = if count == 1 {
+                self.stream.try_write(&slices[0])
+            } else {
+                self.stream.try_write_vectored(&slices[..count])
+            };
+            match result {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => IoSlice::advance_slices(&mut slices, n),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
         while !slices.is_empty() {
             let deadline = *deadline_rx.borrow_and_update();
             self.check(deadline)?;
@@ -612,12 +630,21 @@ impl TcpConn {
 impl Conn for TcpConn {
     async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut deadline_rx = self.read_deadline.subscribe();
+        // Reads are usually ready; try them without arming the deadline and
+        // close watchers first.
+        let deadline = *deadline_rx.borrow_and_update();
+        self.check(deadline)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.stream.try_read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
         loop {
             let deadline = *deadline_rx.borrow_and_update();
             self.check(deadline)?;
-            if buf.is_empty() {
-                return Ok(0);
-            }
             tokio::select! {
                 biased;
                 _ = self.closed.cancelled() => return Err(error::closed()),
@@ -636,6 +663,9 @@ impl Conn for TcpConn {
     }
 
     async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         self.write_slices(&mut [IoSlice::new(buf)]).await?;
         Ok(buf.len())
     }
@@ -678,9 +708,29 @@ impl Conn for TcpConn {
         true
     }
 
-    async fn write_vectorised(&self, buffers: Vec<Buffer>) -> io::Result<()> {
+    async fn write_vectorised(&self, mut buffers: Vec<Buffer>) -> io::Result<()> {
+        buffers.retain(|buffer| !buffer.is_empty());
+        if buffers.is_empty() {
+            return Ok(());
+        }
         let mut slices: Vec<IoSlice<'_>> = buffers.iter().map(|buffer| IoSlice::new(buffer.bytes())).collect();
         self.write_slices(&mut slices).await
+    }
+
+    fn initialize_read_waiter(&self, options: ReadWaitOptions) -> bool {
+        *self.read_options.lock().unwrap() = options;
+        // Buffers are allocated with the requested headroom, so the copy loop
+        // does not need to copy them.
+        false
+    }
+
+    async fn wait_read_buffer(&self) -> io::Result<Option<Buffer>> {
+        let options = *self.read_options.lock().unwrap();
+        let mut buffer = options.new_buffer();
+        match self.read_buffer(&mut buffer).await? {
+            0 => Ok(None),
+            _ => Ok(Some(buffer)),
+        }
     }
 }
 

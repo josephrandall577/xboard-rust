@@ -12,7 +12,7 @@ use xboard_snell::config::{AdminConfig, Config, ManagedNodeConfig, NodeConfig, P
 use xboard_snell::node::Node;
 
 const PSK: &str = "integration-test-psk-0123456789";
-const MODES: [&str; 3] = ["default", "unshaped", "unsafe-raw"];
+const MODES: [&str; 1] = ["default"];
 
 struct Harness {
     node: Arc<Node>,
@@ -70,8 +70,7 @@ impl Harness {
 
     fn client(&self, user_key: &str) -> Client {
         Client::new(ClientOptions {
-            psk: PSK.as_bytes().to_vec(),
-            user_key: user_key.as_bytes().to_vec(),
+            psk: user_key.as_bytes().to_vec(),
             mode: v6::parse_mode(&self.node.config.node.mode).unwrap(),
             server: Socksaddr::parse(&self.address),
             ..Default::default()
@@ -154,8 +153,8 @@ async fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v6_round_trip_is_metered_per_user() {
     for mode in MODES {
-        let harness = Harness::start(mode, vec![spec(1, "alice-key")]).await;
-        let client = harness.client("alice-key");
+        let harness = Harness::start(mode, vec![spec(1, "alice-key-unique-psk")]).await;
+        let client = harness.client("alice-key-unique-psk");
         let payload = vec![0x42u8; 8 * 1024];
         let received = round_trip(&client, &harness.address, &payload).await.unwrap();
         assert_eq!(payload, received, "mode {mode}");
@@ -170,9 +169,9 @@ async fn v6_round_trip_is_metered_per_user() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unknown_user_key_is_rejected() {
-    let harness = Harness::start("unshaped", vec![spec(1, "alice-key")]).await;
-    let client = harness.client("mallory-key");
+async fn unknown_psk_is_rejected() {
+    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let client = harness.client("mallory-key-unique-psk");
     let result = round_trip(&client, &harness.address, b"nope").await;
     assert!(result.is_err(), "unauthenticated user must be refused: {result:?}");
     harness.shutdown().await;
@@ -180,9 +179,9 @@ async fn unknown_user_key_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peers_are_metered_independently() {
-    let harness = Harness::start("unshaped", vec![spec(1, "alice-key"), spec(2, "bob-key")]).await;
-    let alice = harness.client("alice-key");
-    let bob = harness.client("bob-key");
+    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
+    let alice = harness.client("alice-key-unique-psk");
+    let bob = harness.client("bob-key-unique-psk");
     round_trip(&alice, &harness.address, &vec![1u8; 2048]).await.unwrap();
     round_trip(&bob, &harness.address, &vec![2u8; 4096]).await.unwrap();
 
@@ -196,8 +195,8 @@ async fn peers_are_metered_independently() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn traffic_is_persisted_to_store() {
-    let harness = Harness::start("unshaped", vec![spec(1, "alice-key")]).await;
-    let client = harness.client("alice-key");
+    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let client = harness.client("alice-key-unique-psk");
     round_trip(&client, &harness.address, &vec![7u8; 4096]).await.unwrap();
     // Wait for the panel report (10s) to persist traffic.
     wait_until(Duration::from_secs(15), || {
@@ -211,10 +210,10 @@ async fn traffic_is_persisted_to_store() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn device_limit_refuses_extra_source_ips() {
-    let mut user = spec(1, "alice-key");
+    let mut user = spec(1, "alice-key-unique-psk");
     user.device_limit = 1;
-    let harness = Harness::start("unshaped", vec![user]).await;
-    let client = harness.client("alice-key");
+    let harness = Harness::start("default", vec![user]).await;
+    let client = harness.client("alice-key-unique-psk");
     // The first connection from 127.0.0.1 registers the device.
     round_trip(&client, &harness.address, b"first").await.unwrap();
     // The registry records the source IP while the connection is open; the
@@ -231,10 +230,10 @@ async fn device_limit_refuses_extra_source_ips() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_user_is_refused() {
-    let mut user = spec(1, "alice-key");
+    let mut user = spec(1, "alice-key-unique-psk");
     user.expired_at = xboard_snell::config::unix_now() - 1;
-    let harness = Harness::start("unshaped", vec![user]).await;
-    let client = harness.client("alice-key");
+    let harness = Harness::start("default", vec![user]).await;
+    let client = harness.client("alice-key-unique-psk");
     let result = round_trip(&client, &harness.address, b"expired").await;
     assert!(result.is_err(), "expired user must be refused");
     harness.shutdown().await;
@@ -242,13 +241,13 @@ async fn expired_user_is_refused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quota_exhausted_user_is_refused() {
-    let mut user = spec(1, "alice-key");
+    let mut user = spec(1, "alice-key-unique-psk");
     user.transfer_enable = 1;
-    let harness = Harness::start("unshaped", vec![user]).await;
+    let harness = Harness::start("default", vec![user]).await;
     // Mark the quota as fully used before the connection is attempted.
     harness.node.store.add_traffic(&[(1, xboard_snell::config::Traffic { upload: 1, download: 0 })]).unwrap();
     harness.node.registry.apply_users(&harness.node.store.list_users().unwrap());
-    let client = harness.client("alice-key");
+    let client = harness.client("alice-key-unique-psk");
     let result = round_trip(&client, &harness.address, b"over quota").await;
     assert!(result.is_err(), "user over quota must be refused");
     harness.shutdown().await;
@@ -268,8 +267,11 @@ async fn limited_tcp_transfer(harness: &Harness, seed: u8) {
         stream.write_all(&target_reply).await.unwrap();
         received
     });
-    let proxy =
-        harness.client("limited-key").dial_conn(dial(&harness.address).await, destination.into()).await.unwrap();
+    let proxy = harness
+        .client("limited-key-unique-psk")
+        .dial_conn(dial(&harness.address).await, destination.into())
+        .await
+        .unwrap();
     proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(15))).unwrap();
     proxy.write(&payload).await.unwrap();
     proxy.close_write().await.unwrap();
@@ -293,7 +295,7 @@ async fn limited_tcp_transfer(harness: &Harness, seed: u8) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn limited_tcp_preserves_concurrent_streams() {
     for mode in MODES {
-        let mut user = spec(1, "limited-key");
+        let mut user = spec(1, "limited-key-unique-psk");
         user.speed_limit = 1;
         let harness = Harness::start(mode, vec![user]).await;
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -311,7 +313,7 @@ async fn limited_tcp_preserves_concurrent_streams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn limited_udp_preserves_complete_datagrams() {
     for mode in MODES {
-        let mut user = spec(1, "limited-key");
+        let mut user = spec(1, "limited-key-unique-psk");
         user.speed_limit = 1;
         let harness = Harness::start(mode, vec![user]).await;
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -327,7 +329,7 @@ async fn limited_udp_preserves_complete_datagrams() {
             }
             packets
         });
-        let proxy = harness.client("limited-key").dial_packet_conn(dial(&harness.address).await).unwrap();
+        let proxy = harness.client("limited-key-unique-psk").dial_packet_conn(dial(&harness.address).await).unwrap();
         proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(10))).unwrap();
         let mut replies = Vec::new();
         for size in [4096, 8192] {
@@ -363,7 +365,7 @@ async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
         name: name.into(),
         listen: if ip.contains(":") { format!("[{ip}]:0") } else { format!("{ip}:0") },
         psk: psk.into(),
-        mode: "unshaped".into(),
+        mode: "default".into(),
         panel: PanelConfig {
             url: "http://127.0.0.1:9".into(),
             token: format!("panel-{name}"),
@@ -393,10 +395,8 @@ async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
     let nodes = Node::start_many(config).await.unwrap();
     assert_eq!(2, nodes.len());
     let payloads = [b"node-a-payload".to_vec(), b"node-b-payload".to_vec()];
-    for (index, ((node, expected_ip), psk)) in
-        nodes.iter().zip(["127.0.0.1", "::1"]).zip(["managed-node-psk-a-001", "managed-node-psk-b-002"]).enumerate()
-    {
-        let key = format!("key-{}", node.name);
+    for (index, (node, expected_ip)) in nodes.iter().zip(["127.0.0.1", "::1"]).enumerate() {
+        let key = format!("unique-psk-{}", node.name);
         let user = xboard_snell::config::User {
             id: 7,
             uuid: key.clone(),
@@ -422,9 +422,8 @@ async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
         });
         let server_addr = node.server.read().await.as_ref().unwrap().local_addr();
         let client = Client::new(ClientOptions {
-            psk: psk.as_bytes().to_vec(),
-            user_key: key.as_bytes().to_vec(),
-            mode: v6::Mode::Unshaped,
+            psk: key.as_bytes().to_vec(),
+            mode: v6::Mode::Default,
             server: Socksaddr::from(server_addr),
             ..Default::default()
         })
@@ -472,4 +471,54 @@ async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
     for node in &nodes {
         node.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_client_id_cannot_change_the_billed_user() {
+    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
+    let client = Client::new(ClientOptions {
+        psk: b"alice-key-unique-psk".to_vec(),
+        user_key: b"bob-key-unique-psk".to_vec(),
+        server: Socksaddr::parse(&harness.address),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        b"charged-to-alice",
+        round_trip(&client, &harness.address, b"charged-to-alice").await.unwrap().as_slice()
+    );
+    wait_until(Duration::from_secs(5), || harness.node.registry.state(1).unwrap().totals().download == 16).await;
+    assert_eq!(32, harness.node.registry.state(1).unwrap().totals().total());
+    assert_eq!(0, harness.node.registry.state(2).unwrap().totals().total());
+    // The legacy shared server PSK grants no access, even with a valid victim ID.
+    let legacy = Client::new(ClientOptions {
+        psk: PSK.as_bytes().to_vec(),
+        user_key: b"bob-key-unique-psk".to_vec(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(round_trip(&legacy, &harness.address, b"denied").await.is_err());
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn psk_rotation_and_empty_snapshot_revoke_access_without_rebinding() {
+    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let old_client = harness.client("alice-key-unique-psk");
+    round_trip(&old_client, &harness.address, b"before").await.unwrap();
+    let server = harness.node.server.read().await.clone().unwrap();
+    let user: xboard_snell::config::User = spec(1, "alice-rotated-new-psk").into();
+    server.update_users(std::slice::from_ref(&user)).unwrap();
+    harness.node.registry.apply_users(&[user]);
+    assert!(round_trip(&old_client, &harness.address, b"denied").await.is_err());
+    let new_client = harness.client("alice-rotated-new-psk");
+    round_trip(&new_client, &harness.address, b"after").await.unwrap();
+    // Invalid updates leave the working credential set in place.
+    let invalid: xboard_snell::config::User = spec(2, "short").into();
+    assert!(server.update_users(&[invalid]).is_err());
+    round_trip(&new_client, &harness.address, b"still-works").await.unwrap();
+    server.update_users(&[]).unwrap();
+    harness.node.registry.apply_users(&[]);
+    assert!(round_trip(&new_client, &harness.address, b"denied").await.is_err());
+    harness.shutdown().await;
 }

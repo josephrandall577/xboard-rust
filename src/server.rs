@@ -1,4 +1,4 @@
-//! The Snell v6 service wiring: per-user keys, mode and listener lifecycle.
+//! The Snell v6 service wiring: per-user PSKs and listener lifecycle.
 
 use std::io;
 use std::net::SocketAddr;
@@ -16,7 +16,7 @@ use crate::relay::RelayHandler;
 
 /// The running Snell v6 server.
 pub struct SnellServer {
-    service: v6::MultiService<crate::relay::AuthedUser>,
+    service: v6::MultiPskService<crate::relay::AuthedUser>,
     registry: Arc<Registry>,
     cancel: CancellationToken,
     local_addr: std::net::SocketAddr,
@@ -45,11 +45,7 @@ impl SnellServer {
             cancel: cancel.clone(),
             tasks: tasks.clone(),
         });
-        let service = v6::MultiService::<crate::relay::AuthedUser>::new(v6::ServerOptions {
-            psk: config.node.psk.as_bytes().to_vec(),
-            mode,
-            handler,
-        })?;
+        let service = v6::MultiPskService::<crate::relay::AuthedUser>::new(mode, handler)?;
         let users = registry.users();
         apply_users(&service, &users)?;
 
@@ -126,26 +122,11 @@ impl SnellServer {
     }
 }
 
-fn apply_users(service: &v6::MultiService<crate::relay::AuthedUser>, users: &[crate::config::User]) -> io::Result<()> {
+fn apply_users(
+    service: &v6::MultiPskService<crate::relay::AuthedUser>,
+    users: &[crate::config::User],
+) -> io::Result<()> {
     let keys: Vec<Vec<u8>> = users.iter().map(|user| user.key().to_vec()).collect();
-    // The Snell multi-user service rejects an empty user set; a node with no
-    // active users must still start and later accept a panel push, so keep a
-    // placeholder key that no client can present.
-    if users.is_empty() {
-        let placeholder = crate::config::User {
-            id: -1,
-            uuid: "\0disabled".into(),
-            speed_limit: 0,
-            device_limit: 0,
-            transfer_enable: 0,
-            expired_at: 0,
-            enabled: false,
-            upload: 0,
-            download: 0,
-        };
-        let entry = crate::config::UserEntry::from(&placeholder);
-        return service.update_users(vec![entry], vec![b"\0disabled".to_vec()]);
-    }
     let entries: Vec<crate::config::UserEntry> = users.iter().map(crate::config::UserEntry::from).collect();
     service.update_users(entries, keys)
 }
@@ -173,12 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_user_set_uses_placeholder() {
+    fn empty_user_set_and_invalid_psks() {
         let registry = Arc::new(Registry::new(std::time::Duration::from_secs(60)));
-        let service = v6::MultiService::<crate::relay::AuthedUser>::new(v6::ServerOptions {
-            psk: b"0123456789abcdef".to_vec(),
-            mode: v6::Mode::Unshaped,
-            handler: Arc::new(crate::relay::RelayHandler {
+        let service = v6::MultiPskService::<crate::relay::AuthedUser>::new(
+            v6::Mode::Default,
+            Arc::new(crate::relay::RelayHandler {
                 registry,
                 counters: Arc::new(crate::accounting::Counters::default()),
                 enforce_quota: true,
@@ -187,9 +167,11 @@ mod tests {
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
             }),
-        })
+        )
         .unwrap();
         apply_users(&service, &[]).unwrap();
-        apply_users(&service, &[user(1, "a")]).unwrap();
+        apply_users(&service, &[user(1, "alice-unique-psk")]).unwrap();
+        assert!(apply_users(&service, &[user(1, "short")]).is_err());
+        assert!(apply_users(&service, &[user(1, "alice-unique-psk"), user(2, "alice-unique-psk")]).is_err());
     }
 }

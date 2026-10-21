@@ -3,6 +3,8 @@
 [Surge snell](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell) implemented in Rust.
 
 This is a Rust port of the Go library `sing-snell`, built on tokio.
+This vendored copy comes from [snell-in-rust](https://github.com/josephrandall577/snell-in-rust);
+see [UPSTREAM.md](UPSTREAM.md) for the aligned revision and local extensions.
 
 ## Features
 
@@ -122,3 +124,20 @@ covert, but this is already impossible in 2026. Considering that snell still has
 advantages that other random-traffic protocols do not possess, such as multiplexing
 support with complete TCP semantics and traffic-characteristic diversity, we made this
 instead of reinventing the wheel.
+
+## Independent per-user PSKs (local extension)
+
+`v6::MultiPskService<U>::new(Mode::Default, handler)` serves Surge-compatible
+clients on one port without requiring `client_id`. Call `update_users(users, psks)`
+with unique 12–255-byte PSKs; an empty list revokes all users. Salt fingerprints
+select the PSK and first-record AEAD verification authenticates it. The handler
+receives `ctx.user::<U>()`; request client IDs are ignored for identity. Reused
+requests resolve the current user mapping again. Unknown modes or invalid updates
+are rejected. Failed updates preserve the previous credential snapshot.
+
+The first salt block may have any length from 32 to 144 bytes. Selection compares
+all fixed bytes while ignoring exactly sixteen shuffled salt positions. Overread
+bytes are returned through an internal `PrefixedConn`, and the shaped reader
+starts with its salt already consumed. There is no candidate-by-candidate Argon2
+or AEAD trial. The bounded replay cache is credential-scoped, records only verified
+first records, and persists across user updates, but not process restarts.

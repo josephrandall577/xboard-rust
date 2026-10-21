@@ -2,6 +2,7 @@
 
 mod client;
 mod handshake;
+mod multi_psk;
 mod packet;
 mod profile;
 mod record;
@@ -15,6 +16,7 @@ use std::fmt;
 use std::io;
 
 pub use client::{Client, ClientConn, ClientOptions};
+pub use multi_psk::MultiPskService;
 pub use packet::ClientPacketConn;
 pub use profile::Profile;
 pub use reuse::ReuseConn;

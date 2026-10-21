@@ -1723,7 +1723,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sing-snell"
-version = "0.1.0"
+version = "1.1.2"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2503,7 +2503,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xboard-snell"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "argon2",
  "async-trait",

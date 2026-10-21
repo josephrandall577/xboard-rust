@@ -220,3 +220,29 @@ fn _headers(_: HeaderMap) {}
 
 #[allow(dead_code)]
 fn _json(_: impl IntoResponse) {}
+
+#[tokio::test]
+async fn missing_user_snapshot_is_an_error_but_explicit_empty_revokes_users() {
+    for body in [json!({}), json!({"users": null}), json!({"users": []})] {
+        let expected_empty = body.get("users").is_some_and(Value::is_array);
+        let router = Router::new().route(
+            "/api/v2/server/user",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = client(url, 2).fetch_users().await;
+        if expected_empty {
+            assert!(result.unwrap().is_empty());
+        } else {
+            assert!(result.is_err(), "missing or malformed snapshots must not clear cached users");
+        }
+        task.abort();
+    }
+}

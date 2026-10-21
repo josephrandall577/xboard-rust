@@ -26,7 +26,6 @@ struct Envelope {
 
 #[derive(Deserialize)]
 struct UsersPayload {
-    #[serde(default)]
     users: Vec<PanelUser>,
 }
 
@@ -139,10 +138,8 @@ fn handle_message(
         }
         "sync.users" => {
             let payload: UsersPayload = serde_json::from_value(envelope.data)?;
-            if payload.users.is_empty() {
-                return Ok(());
-            }
             let users: Vec<UserSpec> = payload.users.into_iter().map(Into::into).collect();
+            crate::config::validate_user_psks(&users)?;
             let specs = users.clone();
             store.replace_users(&users)?;
             info!(users = users.len(), "websocket user sync applied");
@@ -190,8 +187,7 @@ mod tests {
             }])
             .unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let event =
-            r#"{"event":"sync.users","data":{"users":[{"id":2,"uuid":"b","speed_limit":10,"device_limit":2}]}}"#;
+        let event = r#"{"event":"sync.users","data":{"users":[{"id":2,"uuid":"bob-unique-psk","speed_limit":10,"device_limit":2}]}}"#;
         handle_message(event, &store, &tx).unwrap();
         let users = store.list_users().unwrap();
         assert_eq!(1, users.len());
@@ -207,6 +203,28 @@ mod tests {
         let event = r#"{"event":"sync.user.delta","data":{"action":"add","users":[{"id":3,"uuid":"c"}]}}"#;
         handle_message(event, &store, &tx).unwrap();
         assert!(store.list_users().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_sync_revokes_all_and_invalid_sync_preserves_previous_credentials() {
+        let store = store();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let valid = r#"{"event":"sync.users","data":{"users":[{"id":1,"uuid":"alice-unique-psk"}]}}"#;
+        handle_message(valid, &store, &tx).unwrap();
+        rx.try_recv().unwrap();
+        for invalid in [
+            r#"{"event":"sync.users","data":{}}"#,
+            r#"{"event":"sync.users","data":{"users":[{"id":2,"uuid":"short"}]}}"#,
+            r#"{"event":"sync.users","data":{"users":[{"id":1,"uuid":"same-unique-psk"},{"id":2,"uuid":"same-unique-psk"}]}}"#,
+            r#"{"event":"sync.users","data":{"users":[{"id":1,"uuid":"alice-unique-psk"},{"id":1,"uuid":"bob-unique-psk"}]}}"#,
+        ] {
+            assert!(handle_message(invalid, &store, &tx).is_err());
+            assert_eq!(1, store.list_users().unwrap()[0].id);
+            assert!(rx.try_recv().is_err());
+        }
+        handle_message(r#"{"event":"sync.users","data":{"users":[]}}"#, &store, &tx).unwrap();
+        assert!(store.list_users().unwrap().is_empty());
+        assert!(rx.try_recv().unwrap().is_empty());
     }
 
     #[test]
