@@ -1,0 +1,39 @@
+[Unit]
+Description=Xboard Snell v6 node
+Documentation=https://github.com/josephrandall577/xboard-snell
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=xboard-snell
+Group=xboard-snell
+WorkingDirectory=/var/lib/xboard-snell
+StateDirectory=xboard-snell
+StateDirectoryMode=0750
+UMask=0077
+ExecStartPre=/usr/local/bin/xboard-snell --check -c /etc/xboard-snell/config.toml
+ExecStart=/usr/local/bin/xboard-snell -c /etc/xboard-snell/config.toml
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=300
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xboard-snell
+
+[Install]
+WantedBy=multi-user.target

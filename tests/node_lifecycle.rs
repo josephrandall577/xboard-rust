@@ -199,7 +199,7 @@ async fn shutdown_waits_for_periodic_report_without_losing_or_duplicating_traffi
     let (url, task) = mock_panel(state.clone()).await;
     let mut config = managed_config(&temp.path().join("concurrent.db"));
     config.nodes[0].panel.url = url;
-    config.nodes[0].panel.push_interval = 0;
+    config.nodes[0].panel.push_interval = 1;
     let nodes = Node::start_many(config).await.unwrap();
     let node = &nodes[0];
     seed(node).await;
@@ -228,7 +228,7 @@ async fn failed_periodic_report_keeps_usage_visible_to_quota_checks() {
     let (url, task) = mock_panel(state.clone()).await;
     let mut config = managed_config(&temp.path().join("quota.db"));
     config.nodes[0].panel.url = url;
-    config.nodes[0].panel.push_interval = 0;
+    config.nodes[0].panel.push_interval = 1;
     let nodes = Node::start_many(config).await.unwrap();
     let node = &nodes[0];
     seed(node).await;

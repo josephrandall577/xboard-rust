@@ -284,7 +284,7 @@ fn truncate(body: &str) -> String {
 }
 
 #[derive(Deserialize)]
-struct PanelUser {
+pub(crate) struct PanelUser {
     id: i64,
     #[serde(default)]
     uuid: String,
@@ -293,6 +293,16 @@ struct PanelUser {
     speed_limit: u64,
     #[serde(default, deserialize_with = "null_as_zero")]
     device_limit: u32,
+    #[serde(default, deserialize_with = "null_as_zero")]
+    transfer_enable: u64,
+    #[serde(default, deserialize_with = "null_as_zero")]
+    expired_at: i64,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn null_as_zero<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -310,9 +320,9 @@ impl From<PanelUser> for UserSpec {
             uuid: user.uuid,
             speed_limit: user.speed_limit,
             device_limit: user.device_limit,
-            transfer_enable: 0,
-            expired_at: 0,
-            enabled: true,
+            transfer_enable: user.transfer_enable,
+            expired_at: user.expired_at,
+            enabled: user.enabled,
         }
     }
 }

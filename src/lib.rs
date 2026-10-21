@@ -1,12 +1,12 @@
 //! Xboard-compatible Snell v6 node backend.
 //!
 //! The node runs the Snell v6 server from the `snell` crate and adds the
-//! parts a landing server needs to be operated by Xboard or standalone:
+//! parts a landing server needs to be operated by Xboard:
 //!
 //! * per-user credentials (`uuid` becomes the Snell v6 user key),
 //! * per-user traffic accounting, quotas, device limits and speed limits,
 //! * a SQLite store that survives restarts,
-//! * a local admin API,
+//! * a read-only local monitoring API,
 //! * an Xboard panel client for user sync and traffic reporting (V1 and V2).
 
 pub mod accounting;

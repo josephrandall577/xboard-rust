@@ -1,7 +1,7 @@
 //! SQLite-backed user and traffic store.
 //!
-//! The store is the single source of truth for the node: the Snell v6 user
-//! map, the admin API and the panel sync all read and write through it.
+//! The store caches panel users for the Snell v6 listener and read-only admin
+//! API, and persists local usage together with undelivered panel reports.
 //! Traffic counters are aggregated into the database on a timer, not on
 //! every packet, so the hot path only touches atomics.
 
@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::{info, warn};
 
 use crate::config::{Traffic, User, UserSpec};
 
@@ -308,27 +307,6 @@ impl Store {
             )?;
             Ok(())
         })
-    }
-
-    /// Loads and applies the initial local user set from the configuration.
-    /// Existing users with the same uuid keep their traffic counters.
-    pub fn seed_from_config(&self, specs: &[UserSpec]) -> Result<(), StoreError> {
-        if specs.is_empty() {
-            return Ok(());
-        }
-        // Seed entry by entry so one malformed entry cannot abort startup
-        // or discard the valid ones.
-        let existing = self.list_users()?;
-        if existing.is_empty() {
-            info!(users = specs.len(), "seeding local users from configuration");
-        }
-        for spec in specs {
-            match self.upsert_user(spec) {
-                Ok(_) => {}
-                Err(err) => warn!(user = spec.id, error = %err, "failed to seed local user"),
-            }
-        }
-        Ok(())
     }
 }
 

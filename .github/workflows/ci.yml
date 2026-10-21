@@ -39,6 +39,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  deployment:
+    name: Installer and systemd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build installer smoke-test binary
+        run: cargo build --locked
+      - name: Shell and installer checks
+        run: |
+          bash -n scripts/install.sh
+          shellcheck scripts/install.sh
+          python scripts/test_install.py
+          python scripts/test_download_site.py
+          node --check web/site.js
+      - name: Verify systemd unit
+        run: |
+          sudo install -m 0755 target/debug/xboard-snell /usr/local/bin/xboard-snell
+          systemd-analyze verify systemd/xboard-snell.service
+
   interop:
     name: Go reference interoperability
     runs-on: ubuntu-24.04

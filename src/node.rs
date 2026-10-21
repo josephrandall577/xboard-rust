@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::accounting::{Counters, Registry};
 use crate::admin::AdminState;
 use crate::config::Config;
-use crate::panel::{PanelClient, SystemStatus, build_metrics, log_panel_error, system_status};
+use crate::panel::{PanelClient, build_metrics, log_panel_error, system_status};
 use crate::server::SnellServer;
 use crate::store::Store;
 
@@ -33,7 +33,7 @@ pub struct Node {
     pub store: Store,
     pub registry: Arc<Registry>,
     pub counters: Arc<Counters>,
-    pub panel: Option<Arc<PanelClient>>,
+    pub panel: Arc<PanelClient>,
     pub server: Arc<RwLock<Option<Arc<SnellServer>>>>,
     cancel: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -72,7 +72,11 @@ impl Node {
         Ok(nodes)
     }
 
-    pub async fn start(config: Config) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start(mut config: Config) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
+        config.validate()?;
+        if !config.nodes.is_empty() {
+            return Err("use Node::start_many for a multi-node configuration".into());
+        }
         Self::start_inner(config, "default".into(), None).await
     }
 
@@ -82,22 +86,13 @@ impl Node {
         outbound: Option<SocketAddr>,
     ) -> Result<Arc<Node>, Box<dyn std::error::Error + Send + Sync>> {
         crate::mark_start();
+        let panel_config = config.panel.as_ref().ok_or(crate::config::ConfigError::MissingPanel)?;
+        let panel = Arc::new(PanelClient::new(panel_config.clone())?);
         let store = Store::open(&config.storage.path)?;
-        if config.panel.is_none() {
-            store.seed_from_config(&config.node.users)?;
-        }
         let registry = Arc::new(Registry::new(Duration::from_secs(config.limits.device_ttl)));
         let counters = Arc::new(Counters::default());
         let users = store.list_users()?;
         registry.apply_users(&users);
-
-        let panel = match &config.panel {
-            Some(panel_config) => {
-                let client = PanelClient::new(panel_config.clone())?;
-                Some(Arc::new(client))
-            }
-            None => None,
-        };
 
         // Bind every required endpoint before reporting startup success.
         let admin_listener =
@@ -116,7 +111,6 @@ impl Node {
             store: store.clone(),
             registry: registry.clone(),
             counters: counters.clone(),
-            server: server.clone(),
             token: Arc::from(config.admin.token.clone()),
         };
 
@@ -138,7 +132,9 @@ impl Node {
         node.tasks.get_mut().push({
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                let Some(listener) = admin_listener else { return };
+                let Some(listener) = admin_listener else {
+                    return;
+                };
                 tokio::select! {
                     _ = cancel.cancelled() => {}
                     result = crate::admin::serve_listener(listener, admin_state) => {
@@ -152,31 +148,14 @@ impl Node {
 
         node.spawn_panel_tasks();
 
-        // The report lock serializes periodic drains with final shutdown.
-        // Panel mode persists both usage and undelivered deltas atomically.
-        if node.panel.is_none() {
-            node.tasks.get_mut().push({
-                let cancel = cancel.clone();
-                let registry = node.registry.clone();
-                let store = node.store.clone();
-                let report_lock = node.report_lock.clone();
-                tokio::spawn(async move {
-                    flush_loop(registry, store, cancel, report_lock).await;
-                })
-            });
-        }
-
         Ok(Arc::new(node))
     }
 
     fn spawn_panel_tasks(&mut self) {
-        let Some(panel) = self.panel.clone() else {
-            info!("no panel configured, running in standalone mode");
-            return;
-        };
-        let pull_interval =
-            Duration::from_secs(if panel_interval(&self.config) > 0 { panel_interval(&self.config) } else { 60 });
-        let push_interval = Duration::from_secs(self.config.panel.as_ref().map(|p| p.push_interval).unwrap_or(60));
+        let panel = self.panel.clone();
+        let panel_config = self.config.panel.as_ref().expect("validated panel configuration");
+        let pull_interval = Duration::from_secs(panel_config.pull_interval);
+        let push_interval = Duration::from_secs(panel_config.push_interval);
 
         let cancel = self.cancel.clone();
         let store = self.store.clone();
@@ -199,14 +178,14 @@ impl Node {
 
         // Panel WebSocket push (optional): polling above stays the baseline,
         // so a missing socket only adds latency to user changes.
-        if let Some(ws_url) = self.config.panel.as_ref().and_then(|panel| panel.ws_url.clone()) {
+        if let Some(ws_url) = panel_config.ws_url.clone() {
             let cancel = self.cancel.clone();
             let store = self.store.clone();
             let registry = self.registry.clone();
             let server = self.server.clone();
-            let token = self.config.panel.as_ref().map(|panel| panel.token.clone()).unwrap_or_default();
-            let node_id = self.config.panel.as_ref().map(|panel| panel.node_id).unwrap_or_default();
-            let machine_id = self.config.panel.as_ref().and_then(|panel| panel.machine_id);
+            let token = panel_config.token.clone();
+            let node_id = panel_config.node_id;
+            let machine_id = panel_config.machine_id;
             let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<crate::config::UserSpec>>();
             let events_store = store.clone();
             self.tasks.get_mut().push(tokio::spawn(async move {
@@ -219,8 +198,7 @@ impl Node {
                         _ = cancel.cancelled() => break,
                         users = events_rx.recv() => {
                             let Some(_users) = users else { break };
-                            // Reload from the store so traffic counters and
-                            // local-only fields stay authoritative.
+                            // Reload the synchronized users together with their persisted counters.
                             match events_store.list_users() {
                                 Ok(users) => apply_users(&registry, &server, users).await,
                                 Err(err) => warn!(error = %err, "failed to reload users after ws sync"),
@@ -246,11 +224,7 @@ impl Node {
                 self.cancel.cancel();
                 // Let an in-flight report finish before taking its final snapshot.
                 let _guard = self.report_lock.lock().await;
-                if let Some(panel) = &self.panel {
-                    report_pending(panel, &self.store, &self.registry, &self.counters).await;
-                } else {
-                    floor_flush(&self.registry, &self.store);
-                }
+                report_pending(&self.panel, &self.store, &self.registry, &self.counters).await;
                 let tasks = std::mem::take(&mut *self.tasks.lock().await);
                 for task in &tasks {
                     task.abort();
@@ -302,10 +276,6 @@ async fn apply_users(
     debug!(users = count, "user set applied");
 }
 
-fn panel_interval(config: &Config) -> u64 {
-    config.panel.as_ref().map(|panel| panel.pull_interval).unwrap_or(60)
-}
-
 async fn pull_loop(
     panel: Arc<PanelClient>,
     store: Store,
@@ -323,10 +293,12 @@ async fn pull_loop(
         }
         Err(err) => log_panel_error("handshake", &err),
     }
+    let mut ticks = tokio::time::interval(interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(interval) => {}
+            _ = ticks.tick() => {}
         }
         match panel.fetch_users().await {
             Ok(users) => {
@@ -453,29 +425,3 @@ fn current_metrics(registry: &Registry, counters: &Counters, total_users: usize)
         0,
     )
 }
-
-async fn flush_loop(registry: Arc<Registry>, store: Store, cancel: CancellationToken, report_lock: Arc<Mutex<()>>) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-        }
-        let _guard = report_lock.lock().await;
-        if cancel.is_cancelled() {
-            break;
-        }
-        if let Err(err) = registry.persist_pending(|deltas| store.add_traffic(deltas)) {
-            warn!(error = %err, "failed to persist traffic counters");
-        }
-    }
-}
-
-/// Synchronously drains pending counters into the store during shutdown.
-fn floor_flush(registry: &Registry, store: &Store) {
-    if let Err(err) = registry.persist_pending(|deltas| store.add_traffic(deltas)) {
-        error!(error = %err, "failed to flush traffic during shutdown");
-    }
-}
-
-#[allow(dead_code)]
-fn _status(_: SystemStatus) {}

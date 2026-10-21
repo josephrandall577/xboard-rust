@@ -1,0 +1,15 @@
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: no-store
+/latest.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: no-store
+/version.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+/xboard-snell/releases/*/version.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store

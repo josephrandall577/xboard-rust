@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::UserSpec;
-use crate::panel::PanelClient;
+use crate::panel::{PanelClient, PanelUser};
 use crate::store::Store;
 
 #[derive(Deserialize)]
@@ -28,31 +28,6 @@ struct Envelope {
 struct UsersPayload {
     #[serde(default)]
     users: Vec<PanelUser>,
-}
-
-#[derive(Deserialize)]
-struct PanelUser {
-    id: i64,
-    #[serde(default)]
-    uuid: String,
-    #[serde(default)]
-    speed_limit: u64,
-    #[serde(default)]
-    device_limit: u32,
-}
-
-impl From<PanelUser> for UserSpec {
-    fn from(user: PanelUser) -> Self {
-        UserSpec {
-            id: user.id,
-            uuid: user.uuid,
-            speed_limit: user.speed_limit,
-            device_limit: user.device_limit,
-            transfer_enable: 0,
-            expired_at: 0,
-            enabled: true,
-        }
-    }
 }
 
 /// Runs the WebSocket client until cancelled, reconnecting with backoff.

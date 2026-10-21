@@ -1,9 +1,4 @@
-//! Local admin API.
-//!
-//! This is the node's management surface when no panel is configured (and a
-//! convenience surface when one is): user CRUD, traffic reset, live stats and
-//! health. All writes go through the store and are then pushed to the live
-//! Snell service, so the data plane and the database never diverge.
+//! Read-only local health, statistics and panel user queries.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,14 +6,13 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::info;
 
 use crate::accounting::{Counters, Registry};
 use crate::config::{UserSpec, unix_now};
-use crate::server::SnellServer;
 use crate::store::{Store, StoreError};
 
 #[derive(Clone)]
@@ -26,33 +20,14 @@ pub struct AdminState {
     pub store: Store,
     pub registry: Arc<Registry>,
     pub counters: Arc<Counters>,
-    pub server: Arc<tokio::sync::RwLock<Option<Arc<SnellServer>>>>,
     pub token: Arc<String>,
-}
-
-impl AdminState {
-    pub async fn reload_users(&self) -> Result<(), StoreError> {
-        let users = self.store.list_users()?;
-        self.registry.apply_users(&users);
-        let guard = self.server.read().await;
-        if let Some(server) = guard.as_ref()
-            && let Err(err) = server.update_users(&users)
-        {
-            return Err(StoreError::Invalid(format!("apply users to snell service: {err}")));
-        }
-        Ok(())
-    }
 }
 
 pub fn router(state: AdminState) -> Router {
     let protected = Router::new()
         .route("/api/v1/stats", get(stats))
-        .route("/api/v1/users", get(list_users).post(create_user))
-        .route("/api/v1/users/{id}", get(get_user).put(update_user).delete(delete_user))
-        .route("/api/v1/users/{id}/traffic", post(reset_user_traffic))
-        .route("/api/v1/traffic/reset", post(reset_all_traffic))
-        .route("/api/v1/users/{id}/block", put(block_user))
-        .route("/api/v1/users/{id}/unblock", put(unblock_user))
+        .route("/api/v1/users", get(list_users))
+        .route("/api/v1/users/{id}", get(get_user))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
     // Health stays public so process supervisors can probe it without the
@@ -222,117 +197,6 @@ async fn get_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Respo
         Ok(None) => error_response(StatusCode::NOT_FOUND, "user not found"),
         Err(err) => store_error(err),
     }
-}
-
-#[derive(Deserialize)]
-struct CreateUser {
-    id: i64,
-    uuid: String,
-    #[serde(default)]
-    speed_limit: u64,
-    #[serde(default)]
-    device_limit: u32,
-    #[serde(default)]
-    transfer_enable: u64,
-    #[serde(default)]
-    expired_at: i64,
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-async fn create_user(State(state): State<AdminState>, Json(body): Json<CreateUser>) -> Response {
-    let spec = UserSpec {
-        id: body.id,
-        uuid: body.uuid,
-        speed_limit: body.speed_limit,
-        device_limit: body.device_limit,
-        transfer_enable: body.transfer_enable,
-        expired_at: body.expired_at,
-        enabled: body.enabled,
-    };
-    if state.store.get_user(spec.id).ok().flatten().is_some() {
-        return error_response(StatusCode::CONFLICT, "user id already exists");
-    }
-    match state.store.upsert_user(&spec) {
-        Ok(user) => match state.reload_users().await {
-            Ok(()) => Json(user_view(&state, user)).into_response(),
-            Err(err) => store_error(err),
-        },
-        Err(err) => store_error(err),
-    }
-}
-
-async fn update_user(State(state): State<AdminState>, Path(id): Path<i64>, Json(body): Json<CreateUser>) -> Response {
-    if body.id != id {
-        return error_response(StatusCode::BAD_REQUEST, "user id in body does not match path");
-    }
-    match state.store.upsert_user(&UserSpec {
-        id,
-        uuid: body.uuid,
-        speed_limit: body.speed_limit,
-        device_limit: body.device_limit,
-        transfer_enable: body.transfer_enable,
-        expired_at: body.expired_at,
-        enabled: body.enabled,
-    }) {
-        Ok(user) => match state.reload_users().await {
-            Ok(()) => Json(user_view(&state, user)).into_response(),
-            Err(err) => store_error(err),
-        },
-        Err(err) => store_error(err),
-    }
-}
-
-async fn delete_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
-    match state.store.delete_user(id) {
-        Ok(true) => match state.reload_users().await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(err) => store_error(err),
-        },
-        Ok(false) => error_response(StatusCode::NOT_FOUND, "user not found"),
-        Err(err) => store_error(err),
-    }
-}
-
-async fn reset_user_traffic(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
-    match state.store.reset_traffic(Some(id)) {
-        Ok(0) => error_response(StatusCode::NOT_FOUND, "user not found"),
-        Ok(_) => match state.reload_users().await {
-            Ok(()) => Json(serde_json::json!({"data": true})).into_response(),
-            Err(err) => store_error(err),
-        },
-        Err(err) => store_error(err),
-    }
-}
-
-async fn reset_all_traffic(State(state): State<AdminState>) -> Response {
-    match state.store.reset_traffic(None) {
-        Ok(count) => match state.reload_users().await {
-            Ok(()) => Json(serde_json::json!({"data": true, "users": count})).into_response(),
-            Err(err) => store_error(err),
-        },
-        Err(err) => store_error(err),
-    }
-}
-
-async fn block_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
-    set_blocked(state, id, true).await
-}
-
-async fn unblock_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
-    set_blocked(state, id, false).await
-}
-
-async fn set_blocked(state: AdminState, id: i64, blocked: bool) -> Response {
-    if state.store.get_user(id).ok().flatten().is_none() {
-        return error_response(StatusCode::NOT_FOUND, "user not found");
-    }
-    state.registry.set_blocked(id, blocked);
-    Json(serde_json::json!({"data": true, "blocked": blocked})).into_response()
 }
 
 #[cfg(test)]

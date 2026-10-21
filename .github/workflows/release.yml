@@ -97,3 +97,12 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
           gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.zip SHA256SUMS --clobber
+
+  pages:
+    name: Publish public download site
+    needs: upload
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    uses: ./.github/workflows/pages.yml
+    with:
+      release_tag: latest
+    secrets: inherit

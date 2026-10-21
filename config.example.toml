@@ -1,7 +1,4 @@
-# xboard-snell configuration.
-#
-# Standalone mode (no panel): users come from the local admin API and this file.
-# Panel mode: the panel is the user source; the admin API remains available.
+# xboard-snell configuration. A panel is required; users are synchronized from it.
 
 [node]
 # Snell v6 listener. The client's Snell server line points here.
@@ -12,19 +9,8 @@ psk = "change-me-to-a-long-random-psk"
 # "default" is the shaped mode Surge 6.x uses by default.
 mode = "default"
 
-# Optional local users (standalone mode). The Snell user key is the uuid;
-# clients configure it as `userkey`.
-# [[node.users]]
-# id = 1
-# uuid = "6f1f8a1e-0000-0000-0000-000000000001"
-# speed_limit = 100          # Mbps, 0 = unlimited
-# device_limit = 3           # distinct source IPs, 0 = unlimited
-# transfer_enable = 0        # bytes, 0 = unlimited
-# expired_at = 0             # unix timestamp, 0 = never
-# enabled = true
-
 [panel]
-# Comment out the whole [panel] table to run standalone.
+# Required Xboard panel connection.
 url = "https://panel.example.com"
 # Node token created in the panel (server_token, or the machine token).
 token = "panel-token"
@@ -39,7 +25,7 @@ push_interval = 60
 
 [admin]
 listen = "127.0.0.1:6161"
-# Bearer token for the admin API. Empty disables authentication.
+# Bearer token for the read-only admin API. Empty disables authentication.
 token = ""
 # disabled = true            # turn the admin API off entirely
 

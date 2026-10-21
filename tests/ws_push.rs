@@ -30,7 +30,8 @@ async fn handle(mut socket: WebSocket) {
         "event": "sync.users",
         "data": {"users": [
             {"id": 1, "uuid": "alice-key", "speed_limit": 128, "device_limit": 2},
-            {"id": 2, "uuid": "bob-key", "speed_limit": 0, "device_limit": 0}
+            {"id": 2, "uuid": "bob-key", "speed_limit": null, "device_limit": null,
+             "transfer_enable": 1024, "expired_at": 123, "enabled": false}
         ]}
     });
     let _ = socket.send(Message::Text(event.to_string().into())).await;
@@ -70,6 +71,10 @@ async fn sync_users_event_updates_store() {
     assert_eq!("alice-key", users[0].uuid);
     assert_eq!(128, users[0].speed_limit);
     assert_eq!(2, users[0].device_limit);
+    assert_eq!(0, users[1].speed_limit);
+    assert_eq!(1024, users[1].transfer_enable);
+    assert_eq!(123, users[1].expired_at);
+    assert!(!users[1].enabled);
 
     let query = params.seen.lock().unwrap().clone();
     assert!(query.iter().any(|(key, value)| key == "token" && value == "panel-token"), "{query:?}");

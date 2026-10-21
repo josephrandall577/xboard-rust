@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="xboard-snell 官方二进制下载、一键安装脚本与版本信息。">
+  <title>xboard-snell · nowhere assets</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <header><a class="brand" href="/">nowhere<span> / assets</span></a><a href="/version.json">版本 JSON ↗</a></header>
+  <main>
+    <section class="hero"><div class="eyebrow">XBOARD NODE BACKEND</div><h1>xboard-snell<span class="version" id="version">稳定版</span></h1><p>Snell v6 落地节点。对接 Xboard 面板，以 systemd 常驻运行。</p><p id="status" role="status">正在获取最新稳定版信息…</p></section>
+    <section class="install"><div class="section-label"><h2>一键安装</h2><span>Linux · x64 / ARM64</span></div><pre><code id="install-command">curl -fsSL https://assets.nowhere.best/install.sh -o install.sh &amp;&amp; sudo bash install.sh</code></pre><p>以 root 权限安装，按提示填写面板地址、Token 和节点 ID。安装脚本自动校验下载文件，并启用开机自启。</p><div class="links"><a href="/install.sh">查看安装脚本 ↗</a><a href="/version.json">查看校验与版本信息 ↗</a></div></section>
+    <section><div class="section-label"><h2>二进制下载</h2><span id="download-version">Linux / macOS / Windows</span></div><div class="table-wrap"><table><thead><tr><th>系统</th><th>架构</th><th>大小</th><th>文件</th></tr></thead><tbody id="downloads"></tbody></table></div><p class="hint">压缩包内含程序与配置示例。macOS 和 Windows 请手动启动；systemd 安装脚本适用于 Linux。</p><noscript><p>请启用 JavaScript 查看下载列表，或直接打开<a href="/version.json">版本 JSON</a>获取文件地址。</p></noscript></section>
+    <section><h2>更新说明</h2><pre class="notes" id="notes">更新说明可在版本 JSON 中查看。</pre></section>
+    <section><h2>历史版本</h2><div class="history" id="history"></div></section>
+  </main>
+  <footer>nowhere assets <span>直接下载 · 无需 GitHub 登录</span></footer>
+</body>
+</html>

@@ -18,6 +18,7 @@ struct Harness {
     node: Arc<Node>,
     address: String,
     temp: tempfile::TempDir,
+    panel_task: tokio::task::JoinHandle<()>,
 }
 
 impl Harness {
@@ -25,9 +26,35 @@ impl Harness {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_test_writer().try_init();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("node.db");
+        let expected_users = users.len();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let panel_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .route("/api/v2/server/handshake", axum::routing::post(|| async { axum::Json(serde_json::json!({})) }))
+            .route(
+                "/api/v2/server/user",
+                axum::routing::get(move || {
+                    let users = users.clone();
+                    async move { axum::Json(serde_json::json!({"users": users})) }
+                }),
+            )
+            .route(
+                "/api/v2/server/report",
+                axum::routing::post(|| async { axum::Json(serde_json::json!({"data": true})) }),
+            );
+        let panel_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Config {
-            node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: mode.into(), users },
-            panel: None,
+            node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: mode.into() },
+            panel: Some(PanelConfig {
+                url: panel_url,
+                token: "test-panel-token".into(),
+                node_id: 1,
+                api_version: 2,
+                pull_interval: 3600,
+                push_interval: 10,
+                ws_url: None,
+                machine_id: None,
+            }),
             admin: xboard_snell::config::AdminConfig { disabled: true, ..Default::default() },
             limits: Default::default(),
             storage: xboard_snell::config::StorageConfig { path: db.to_string_lossy().into_owned() },
@@ -35,9 +62,10 @@ impl Harness {
             nodes: Vec::new(),
         };
         let node = Node::start(config).await.unwrap();
+        wait_until(Duration::from_secs(5), || node.registry.users().len() == expected_users).await;
         let server = node.server.read().await.clone().unwrap();
         let address = server.local_addr().to_string();
-        Harness { node, address, temp }
+        Harness { node, address, temp, panel_task }
     }
 
     fn client(&self, user_key: &str) -> Client {
@@ -53,6 +81,7 @@ impl Harness {
 
     async fn shutdown(&self) {
         self.node.shutdown().await;
+        self.panel_task.abort();
         let _ = &self.temp;
     }
 }
@@ -170,7 +199,7 @@ async fn traffic_is_persisted_to_store() {
     let harness = Harness::start("unshaped", vec![spec(1, "alice-key")]).await;
     let client = harness.client("alice-key");
     round_trip(&client, &harness.address, &vec![7u8; 4096]).await.unwrap();
-    // Wait for the background flush (10s) instead of racing it.
+    // Wait for the panel report (10s) to persist traffic.
     wait_until(Duration::from_secs(15), || {
         harness.node.store.get_user(1).map(|user| user.map(|u| u.used() > 0).unwrap_or(false)).unwrap_or(false)
     })

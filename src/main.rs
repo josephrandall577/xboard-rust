@@ -48,7 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             listen = %node.config.node.listen,
             database = %node.config.storage.path,
             mode = %node.config.node.mode,
-            panel = node.panel.is_some(),
             "xboard-snell node started"
         );
     }

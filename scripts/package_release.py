@@ -40,13 +40,18 @@ def main():
             ("config.example.toml", "config.example.toml"),
             ("config.multi-node.example.toml", "config.multi-node.example.toml"),
             ("README.md", "README.md"),
+            ("scripts/install.sh", "scripts/install.sh"),
+            ("systemd/xboard-snell.service", "systemd/xboard-snell.service"),
             ("snell/LICENSE", "LICENSE"),
         ]:
+            (staging / destination).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / source, staging / destination)
         if windows:
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
-                for member in sorted(staging.iterdir()):
-                    package.write(member, arcname=f"{name}/{member.name}")
+                for member in sorted(staging.rglob("*")):
+                    if not member.is_file():
+                        continue
+                    package.write(member, arcname=f"{name}/{member.relative_to(staging).as_posix()}")
         else:
             with tarfile.open(archive, "w:gz") as package:
                 package.add(staging, arcname=name)

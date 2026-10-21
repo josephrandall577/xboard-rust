@@ -1,0 +1,81 @@
+name: Publish download site
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable release tag to publish (latest follows the latest stable Release)
+        default: latest
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        default: latest
+        required: false
+        type: string
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-download-site
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      PUBLIC_DOWNLOAD_URL: ${{ vars.PUBLIC_DOWNLOAD_URL || 'https://assets.nowhere.best' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Check deployment settings
+        env:
+          PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+          ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          test -n "$PAGES_PROJECT" || { echo 'Set CLOUDFLARE_PAGES_PROJECT in repository variables'; exit 1; }
+          test -n "$ACCOUNT_ID" || { echo 'Set CLOUDFLARE_ACCOUNT_ID in repository variables'; exit 1; }
+          test -n "$API_TOKEN" || { echo 'Set CLOUDFLARE_API_TOKEN in repository Actions secrets'; exit 1; }
+      - name: Build public files from verified Release assets
+        run: >-
+          python scripts/build_download_site.py
+          --repository "$GITHUB_REPOSITORY"
+          --version "$RELEASE_TAG"
+          --base-url "$PUBLIC_DOWNLOAD_URL"
+          --output public
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.151.3'
+          command: pages deploy public --project-name=${{ vars.CLOUDFLARE_PAGES_PROJECT }} --branch=main
+      - name: Show public download links
+        run: |
+          python - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          release = json.loads(Path("public/version.json").read_text())
+          base = os.environ["PUBLIC_DOWNLOAD_URL"].rstrip("/")
+          lines = [f"## Published {release['tag']}", "",
+                   f"- [Download page]({base}/)",
+                   f"- [Linux installer]({base}/install.sh)",
+                   f"- [Latest stable version JSON]({base}/version.json)", ""]
+          for platform in ("linux", "macos", "win"):
+              for arch in ("x64", "arm64"):
+                  lines.append(f"- [{platform} {arch}]({release[platform][arch]['url']})")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PYTHON

@@ -49,7 +49,7 @@ impl User {
     }
 }
 
-/// A user as returned by the panel or configured locally.
+/// A user as returned by the panel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserSpec {
     pub id: i64,
@@ -200,6 +200,7 @@ pub struct ManagedNodeConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -208,14 +209,11 @@ pub struct NodeConfig {
     /// `default`, `unshaped` or `unsafe-raw`.
     #[serde(default = "default_mode")]
     pub mode: String,
-    /// Optional local users, used when no panel is configured.
-    #[serde(default)]
-    pub users: Vec<UserSpec>,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        NodeConfig { listen: default_listen(), psk: String::new(), mode: default_mode(), users: Vec::new() }
+        NodeConfig { listen: default_listen(), psk: String::new(), mode: default_mode() }
     }
 }
 
@@ -377,12 +375,7 @@ impl Config {
 
     pub fn managed_node_config(&self, node: &ManagedNodeConfig) -> Result<Config, ConfigError> {
         let mut config = self.clone();
-        config.node = NodeConfig {
-            listen: node.listen.clone(),
-            psk: node.psk.clone(),
-            mode: node.mode.clone(),
-            users: Vec::new(),
-        };
+        config.node = NodeConfig { listen: node.listen.clone(), psk: node.psk.clone(), mode: node.mode.clone() };
         config.panel = Some(node.panel.clone());
         config.admin = node.admin.clone();
         config.nodes.clear();
@@ -393,10 +386,8 @@ impl Config {
 
     pub fn validate(&mut self) -> Result<(), ConfigError> {
         if !self.nodes.is_empty() {
-            let legacy_node_configured = self.node.listen != default_listen()
-                || self.node.mode != default_mode()
-                || !self.node.psk.is_empty()
-                || !self.node.users.is_empty();
+            let legacy_node_configured =
+                self.node.listen != default_listen() || self.node.mode != default_mode() || !self.node.psk.is_empty();
             let default_admin = AdminConfig::default();
             let legacy_admin_configured = self.admin.listen != default_admin.listen
                 || self.admin.token != default_admin.token
@@ -441,9 +432,7 @@ impl Config {
                     return Err(ConfigError::DuplicatePanelNode(node.name.clone()));
                 }
                 validate_node_credentials(&node.psk, &node.mode)?;
-                if node.panel.url.is_empty() || node.panel.token.is_empty() {
-                    return Err(ConfigError::InvalidPanel(node.name.clone()));
-                }
+                validate_panel(&node.panel, &node.name)?;
             }
             for (index, &admin) in admins.iter().enumerate() {
                 if listeners.iter().any(|&listener| listen_addresses_overlap(admin, listener))
@@ -455,16 +444,8 @@ impl Config {
             return Ok(());
         }
         validate_node_credentials(&self.node.psk, &self.node.mode)?;
-        let mut seen = std::collections::HashSet::new();
-        for user in &mut self.node.users {
-            if user.uuid.is_empty() || user.uuid.len() > 255 {
-                return Err(ConfigError::InvalidUuid(user.id));
-            }
-            if !seen.insert(user.uuid.clone()) {
-                return Err(ConfigError::DuplicateUuid(user.uuid.clone()));
-            }
-            user.enabled = user.enabled && user.expired_at == 0 || user.enabled;
-        }
+        let panel = self.panel.as_ref().ok_or(ConfigError::MissingPanel)?;
+        validate_panel(panel, "default")?;
         Ok(())
     }
 }
@@ -493,6 +474,20 @@ fn managed_storage_path(base: &str, name: &str) -> String {
     path.with_file_name(filename).to_string_lossy().into_owned()
 }
 
+fn validate_panel(panel: &PanelConfig, name: &str) -> Result<(), ConfigError> {
+    let valid_url = url::Url::parse(&panel.url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+    if !valid_url
+        || panel.token.trim().is_empty()
+        || !matches!(panel.api_version, 1 | 2)
+        || panel.pull_interval == 0
+        || panel.push_interval == 0
+    {
+        return Err(ConfigError::InvalidPanel(name.into()));
+    }
+    Ok(())
+}
+
 fn validate_node_credentials(psk: &str, mode: &str) -> Result<(), ConfigError> {
     if !(12..=255).contains(&psk.len()) {
         return Err(ConfigError::InvalidPsk(psk.len()));
@@ -509,8 +504,7 @@ pub enum ConfigError {
     Parse(String),
     InvalidPsk(usize),
     InvalidMode(String),
-    InvalidUuid(i64),
-    DuplicateUuid(String),
+    MissingPanel,
     MixedNodeConfiguration,
     InvalidNodeName(String),
     InvalidNodeListen(String),
@@ -531,12 +525,15 @@ impl fmt::Display for ConfigError {
                 write!(f, "psk must be 12..=255 bytes long (got {len})")
             }
             ConfigError::InvalidMode(mode) => write!(f, "unknown snell v6 mode: {mode}"),
-            ConfigError::InvalidUuid(id) => write!(f, "user {id}: uuid must be 1..=255 bytes"),
-            ConfigError::DuplicateUuid(uuid) => write!(f, "duplicate user uuid: {uuid}"),
-            ConfigError::MixedNodeConfiguration => {
-                write!(f, "managed nodes cannot be combined with legacy node, panel or local users")
+            ConfigError::MissingPanel => {
+                write!(f, "panel configuration is required; standalone mode is no longer supported")
             }
-            ConfigError::InvalidNodeName(name) => write!(f, "invalid or duplicate managed node name: {name}"),
+            ConfigError::MixedNodeConfiguration => {
+                write!(f, "managed nodes cannot be combined with top-level node, panel or admin settings")
+            }
+            ConfigError::InvalidNodeName(name) => {
+                write!(f, "invalid or duplicate managed node name: {name}")
+            }
             ConfigError::InvalidNodeListen(name) => {
                 write!(f, "node {name}: listen must be a literal IP socket address")
             }
@@ -546,8 +543,13 @@ impl fmt::Display for ConfigError {
             ConfigError::DuplicateAdminListen(listen) => {
                 write!(f, "duplicate managed-node admin listen address: {listen}")
             }
-            ConfigError::InvalidPanel(name) => write!(f, "managed node {name}: panel url and token are required"),
-            ConfigError::InvalidAdminListen(name) => write!(f, "node {name}: admin listen must be a socket address"),
+            ConfigError::InvalidPanel(name) => write!(
+                f,
+                "node {name}: panel requires an HTTP(S) URL, non-empty token, API version 1 or 2 and positive pull/push intervals"
+            ),
+            ConfigError::InvalidAdminListen(name) => {
+                write!(f, "node {name}: admin listen must be a socket address")
+            }
             ConfigError::DuplicatePanelNode(name) => {
                 write!(f, "node {name}: another managed node uses the same panel credentials and ID")
             }
@@ -635,12 +637,10 @@ mod tests {
     fn example_config_is_valid() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml");
         let mut config = Config::load(path).expect("example config must parse");
-        // The example ships a panel block; standalone operation only needs
-        // the panel table removed.
         assert_eq!("default", config.node.mode);
         assert!(config.node.psk.len() >= 12);
         config.panel = None;
-        config.validate().unwrap();
+        assert!(matches!(config.validate(), Err(ConfigError::MissingPanel)));
     }
 
     #[test]
@@ -714,6 +714,6 @@ mod tests {
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPsk(5))));
         config.node.psk = "0123456789ab".into();
-        assert!(config.validate().is_ok());
+        assert!(matches!(config.validate(), Err(ConfigError::MissingPanel)));
     }
 }

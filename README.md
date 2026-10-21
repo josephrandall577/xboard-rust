@@ -22,8 +22,11 @@ quota enforcement, alive-IP reporting and node status/metrics.
 - **Xboard panel integration**: V2 (`/api/v2/server/*`, handshake + merged
   report) and legacy V1 (`/api/v1/server/UniProxy/*`), polling plus optional
   WebSocket push (`sync.users`).
-- **Local admin API** and SQLite persistence, so the node works standalone
-  and the data plane never depends on the panel being up.
+- **Panel-only operation**: all users come from Xboard; a read-only local API
+  exposes health, statistics and synchronized users. SQLite caches panel users
+  and pending traffic, so existing users can keep connecting during panel outages.
+- **Linux deployment**: one-command installation of verified amd64/arm64 releases,
+  with a dedicated systemd service account, automatic restart and boot startup.
 
 ## Download binaries
 
@@ -44,8 +47,8 @@ A Git tag push alone does not publish binaries.
 
 Assets are named `xboard-snell-<release-tag>-<target>.<archive-type>`.
 Each archive contains the executable, both single-node and multi-node TOML
-examples, this README and the license.
-binaries statically link the MSVC runtime. macOS binaries are unsigned.
+examples, the installer, the systemd unit, this README and the license.
+Windows binaries statically link the MSVC runtime. macOS binaries are unsigned.
 
 Download the matching archive from [Releases](https://github.com/josephrandall577/xboard-snell/releases),
 extract it, copy `config.example.toml` to `config.toml`, and edit the panel
@@ -66,6 +69,156 @@ the same build and packaging steps without publishing a Release. Manual runs
 provide Actions artifacts and do not attach files to a Release. CI separately
 runs node/library tests on Linux, macOS and Windows, plus bidirectional Go
 interoperability on Linux.
+
+## One-command Linux deployment
+
+Requires Linux with systemd, root access, and an amd64 or arm64 CPU. Install
+`curl`, `tar`, `coreutils` (for `sha256sum`), `useradd` and `getent` if
+missing. On Debian/Ubuntu these are provided by `curl tar coreutils passwd libc-bin`.
+
+~~~sh
+curl -fsSL https://assets.nowhere.best/install.sh -o install.sh
+sudo bash install.sh
+~~~
+
+On first install, enter the panel URL, node token and node ID when prompted.
+The script generates a random server PSK, downloads the latest stable binary
+for this CPU from the public download site, verifies the archive and companion
+systemd unit against `SHA256SUMS`, validates the configuration, and starts the
+service with boot startup enabled. No GitHub login or token is needed on the
+node. To choose a release, add `--version <tag>`. A mirror can be selected with
+`--download-url https://your-download-site.example.com`.
+
+For unattended deployment, pass panel credentials through the environment:
+
+~~~sh
+sudo env PANEL_URL=https://panel.example.com PANEL_TOKEN='your-panel-token' NODE_ID=1 \
+  bash install.sh --listen 0.0.0.0:6160
+~~~
+
+Set `SNELL_PSK` to use an existing server PSK. `--api-version 1` selects the
+legacy panel API. Run `bash install.sh --help` for all options. The generated
+configuration disables the local admin API; enable it with a token if needed.
+Read the server PSK from `[node].psk` in the installed config and configure the
+matching Snell client server address and port. Allow that listening TCP port in
+the host/provider firewall.
+
+| Item | Location |
+| --- | --- |
+| Executable | `/usr/local/bin/xboard-snell` |
+| Configuration (root and service group only) | `/etc/xboard-snell/config.toml` |
+| SQLite databases and service working directory | `/var/lib/xboard-snell/` |
+| systemd unit | `/etc/systemd/system/xboard-snell.service` |
+| Logs | `journalctl -u xboard-snell` |
+
+~~~sh
+sudo systemctl status xboard-snell --no-pager
+sudo journalctl -u xboard-snell -f
+# After editing /etc/xboard-snell/config.toml:
+sudo systemctl restart xboard-snell
+# Stop and disable boot startup:
+sudo systemctl disable --now xboard-snell
+~~~
+
+Run the installer again to upgrade. It preserves the installed configuration and
+SQLite files, validates the new binary against the existing config, then replaces
+the executable and restarts the service. Panel settings passed on later runs do
+not overwrite an existing config. The installer does not install Rust or build
+on the server.
+
+For multi-node deployment or an existing configuration, prepare a panel TOML
+locally and use `sudo bash install.sh --config /path/to/config.toml` on first
+install. Relative storage paths resolve under `/var/lib/xboard-snell`; absolute
+storage paths must also be under this directory for the supplied service's write
+permissions. Multi-node listening IPs must already be assigned to the host.
+
+## Public download site on Cloudflare Pages
+
+The private source repository builds releases in GitHub Actions. Only the
+verified binary archives, install script, service unit, public release notes and
+version metadata are copied into the download site. The site builder checks
+all six platforms and archive SHA256 values before writing its output, and
+rejects assets over Cloudflare Pages' 25 MiB single-file limit. Source files and
+GitHub credentials are not included in the site. A binary can still contain
+embedded build paths or other compiler metadata.
+
+| Public endpoint | Purpose |
+| --- | --- |
+| `https://assets.nowhere.best/` | Download page |
+| `https://assets.nowhere.best/install.sh` | Linux installer |
+| `https://assets.nowhere.best/version.json` | Latest stable version and all platform URLs, SHA256 values and sizes |
+| `https://assets.nowhere.best/latest.txt` | Stable release tag used by the dependency-light installer |
+| `/xboard-snell/releases/<tag>/version.json` | Version details for a retained release |
+| `/xboard-snell/releases/<tag>/SHA256SUMS` | Archive, service and installer checksums |
+
+The manifest uses `schemaVersion: 1`. Top-level `url`, `sha256` and `size`
+refer to Linux x64. `linux`, `macos` and `win` each provide `version`,
+`x64` and `arm64`. Every architecture entry has `url`, `sha256` and
+`size` (bytes). `installer` and `service` describe the companion files;
+`notes` contains the release notes, `stable` repeats the selected stable
+release, and `versions` lists retained version manifests. The site currently
+publishes stable releases only, so the latest and stable version are identical.
+Checksums detect corruption; no signing key or signature is claimed.
+
+The default retention is five stable releases. Older download URLs stop working
+when those releases leave the retained set. Publishing a stable Release triggers
+the site workflow after all binaries are attached. The workflow summary includes
+public installer, metadata and all six platform download links. A missing
+Cloudflare credential fails publication with an explicit configuration error.
+Prereleases and ordinary
+source pushes do not update the public stable download. Maintainers can also run
+**Actions → Publish download site → Run workflow** with a specific stable tag.
+
+Initial setup in the private GitHub repository:
+
+1. Create a Direct Upload Pages project with production branch `main` and
+   associate the public domain. This deployment uses `nowhere-assets`.
+2. Set repository Actions variables `CLOUDFLARE_PAGES_PROJECT` and
+   `CLOUDFLARE_ACCOUNT_ID` to the actual project and account. Optionally set
+   `PUBLIC_DOWNLOAD_URL`; its default is `https://assets.nowhere.best`.
+3. Add Actions secret `CLOUDFLARE_API_TOKEN` with the Cloudflare permission
+   **Account → Cloudflare Pages → Edit**, restricted to the publishing account.
+4. Commit/push these workflows, then run **Publish download site**. Cloudflare
+   MCP authentication is separate from Wrangler/CI authentication; the MCP
+   connection does not automatically create this GitHub secret.
+
+To build locally using an authenticated GitHub CLI and publish with an
+authenticated Wrangler CLI:
+
+~~~sh
+python3 scripts/build_download_site.py --repository josephrandall577/xboard-snell --output public
+npx wrangler@4.151.3 pages deploy public --project-name nowhere-assets --branch main
+~~~
+
+The `public` output directory must not already exist. The Pages project uses
+Direct Upload rather than letting Cloudflare build the private source checkout.
+See [Cloudflare Direct Upload](https://developers.cloudflare.com/pages/get-started/direct-upload/)
+and [CI credentials](https://developers.cloudflare.com/pages/how-to/use-direct-upload-with-continuous-integration/).
+
+## Manual systemd installation
+
+The release archive includes `systemd/xboard-snell.service`. To install without
+the download script, extract the matching verified release and run these commands
+from its directory (create the service account only if it does not exist):
+
+~~~sh
+sudo useradd --system --user-group --home-dir /var/lib/xboard-snell --no-create-home --shell /usr/sbin/nologin xboard-snell
+sudo install -d -m 0750 -o root -g xboard-snell /etc/xboard-snell
+sudo install -d -m 0750 -o xboard-snell -g xboard-snell /var/lib/xboard-snell
+sudo install -m 0755 xboard-snell /usr/local/bin/xboard-snell
+sudo install -m 0640 -o root -g xboard-snell config.example.toml /etc/xboard-snell/config.toml
+# Edit PSK and panel settings before enabling the service:
+sudoedit /etc/xboard-snell/config.toml
+sudo install -m 0644 systemd/xboard-snell.service /etc/systemd/system/xboard-snell.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now xboard-snell
+~~~
+
+The service runs as `xboard-snell`, persists state across restarts, writes logs
+to journald and restarts after failures. It can listen on privileged ports without
+running as root. SIGTERM initiates the node's normal shutdown and final traffic
+persistence/reporting; the unit allows up to 300 seconds for this. The admin API
+health endpoint, if enabled, reports process liveness rather than panel readiness.
 
 ## Multiple panel nodes
 
@@ -117,11 +270,16 @@ With `api_version = 2` the node calls `POST /api/v2/server/handshake`,
 `POST /api/v2/server/report`. With `api_version = 1` it uses the legacy
 `/api/v1/server/UniProxy/{config,user,push,alive,status}` endpoints.
 
-## Standalone setup
+## Upgrading from standalone mode
 
-Leave out the `[panel]` table, declare users under `[[node.users]]` or create
-them through the admin API. Traffic counters live in the SQLite file from
-`[storage]`.
+Standalone operation has been removed. Single-node configurations require a
+valid `[panel]` block; every `[[nodes]]` entry requires its own panel settings.
+Remove all `[[node.users]]` tables: these now fail validation rather than being
+silently ignored. User creation, updates, removal, blocking and quota changes
+must be performed in Xboard. The local API no longer accepts write requests.
+Existing SQLite traffic and pending reports are preserved; cached users are
+replaced by the next successful full panel sync. On a fresh database no clients
+can authenticate until the first successful panel user sync.
 
 ## Admin API
 
@@ -134,16 +292,9 @@ them through the admin API. Traffic counters live in the SQLite file from
 | GET | `/api/v1/stats` | Uptime, connections, device/quota reject counters, aggregate traffic, per-user online counts |
 | GET | `/api/v1/users` | Users with live usage, remaining quota, devices, block state |
 | GET | `/api/v1/users/{id}` | One user |
-| POST | `/api/v1/users` | Create a user (same fields as `[[node.users]]`) |
-| PUT | `/api/v1/users/{id}` | Update a user |
-| DELETE | `/api/v1/users/{id}` | Delete a user |
-| POST | `/api/v1/users/{id}/traffic` | Reset a user's traffic counters |
-| POST | `/api/v1/traffic/reset` | Reset all traffic counters |
-| PUT | `/api/v1/users/{id}/block` | Block a user at the authorization gate |
-| PUT | `/api/v1/users/{id}/unblock` | Unblock a user |
-
-User writes are applied to the live listener immediately; connections that
-already exist keep running.
+The API is read-only. Manage users and traffic allowances in Xboard; updates
+arrive through polling or supported WebSocket pushes. User sync runs immediately
+after the startup handshake, then at the configured pull interval.
 
 ## Semantics
 
@@ -178,12 +329,18 @@ already exist keep running.
 ```sh
 cargo test             # unit, end-to-end v6 and panel contract tests
 cargo clippy --all-targets -- -D warnings
+# Linux/macOS installer smoke tests (isolated; no system services are changed):
+cargo build --locked
+python3 scripts/test_install.py
+python3 scripts/test_download_site.py
 ```
 
 `tests/e2e.rs` drives a real Snell v6 client through the node and checks
 per-user metering, rejection of unknown/expired/over-quota users, device
 limits and persistence. `tests/panel.rs` pins the panel request and response
-shapes against a mock Xboard.
+shapes against a mock Xboard. Installer tests cover verified downloads, both Linux
+CPU architectures, generated config, upgrade data preservation and failure paths.
+Linux CI also runs ShellCheck and validates the systemd unit.
 
 ## Limitations
 
