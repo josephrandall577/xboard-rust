@@ -83,7 +83,7 @@ def main():
         if "INTERP" in elf.stdout:
             raise RuntimeError("musl binary unexpectedly needs a dynamic ELF interpreter")
     checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
+    archive.with_name(archive.name + ".sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8", newline="\n")
     print(f"Verified {archive.name} ({archive.stat().st_size:,} bytes)")
 
 
