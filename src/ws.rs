@@ -42,6 +42,7 @@ pub async fn run(
     events: tokio::sync::mpsc::UnboundedSender<Vec<UserSpec>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
+    crate::panel::warn_insecure_transport(&url);
     let mut backoff = Duration::from_secs(1);
     loop {
         match connect(&url, &token, node_id, machine_id, &store, &events, &cancel).await {
@@ -94,7 +95,7 @@ async fn connect(
     }
 
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
-    info!(url, "panel websocket connected");
+    info!("panel websocket connected");
 
     loop {
         tokio::select! {

@@ -10,6 +10,7 @@ mode = "default"
 
 [panel]
 # Required Xboard panel connection.
+# Use HTTPS: remote HTTP exposes the token and user PSKs and emits a warning.
 url = "https://panel.example.com"
 # Node token created in the panel (server_token, or the machine token).
 token = "panel-token"
@@ -24,11 +25,18 @@ push_interval = 60
 
 [admin]
 listen = "127.0.0.1:6161"
-# Bearer token for the read-only admin API. Empty disables authentication.
+# Bearer token for the read-only admin API. Empty is allowed only on loopback.
 token = ""
 # disabled = true            # turn the admin API off entirely
 
 [limits]
+# Per-node limits for connections that have not passed authentication.
+# Saturation closes new connections immediately; authenticated relays do not count.
+max_handshakes = 256
+# Raise for clients sharing a NAT, or use 0 to disable the per-IP limit.
+max_handshakes_per_ip = 32
+# Absolute budget from admission, in seconds (not reset by incoming bytes).
+handshake_timeout = 10
 # Seconds a source IP keeps counting toward the device limit after its last
 # connection closes.
 device_ttl = 300

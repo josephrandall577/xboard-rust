@@ -88,7 +88,7 @@ pub(crate) fn validate_user_psks(users: &[UserSpec]) -> std::io::Result<()> {
             ));
         }
     }
-    Ok(())
+    snell::v6::validate_psks(users.iter().map(|user| user.uuid.as_bytes()))
 }
 
 impl From<UserSpec> for User {
@@ -287,8 +287,8 @@ fn default_api_version() -> u8 {
 pub struct AdminConfig {
     #[serde(default = "default_admin_listen")]
     pub listen: String,
-    /// Bearer token for the admin API. Empty disables authentication
-    /// (not recommended outside loopback).
+    /// Bearer token for the admin API. Empty is allowed only on loopback
+    /// in single-node mode; managed nodes always require a token.
     #[serde(default)]
     pub token: String,
     /// Disable the admin API entirely.
@@ -308,6 +308,15 @@ fn default_admin_listen() -> String {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LimitsConfig {
+    /// Per-node maximum number of unauthenticated connections.
+    #[serde(default = "default_max_handshakes")]
+    pub max_handshakes: usize,
+    /// Per-source-IP handshake limit. Zero disables this additional limit.
+    #[serde(default = "default_max_handshakes_per_ip")]
+    pub max_handshakes_per_ip: usize,
+    /// Absolute handshake budget in seconds, starting at admission.
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout: u64,
     /// How long a source IP counts as an active device after its last
     /// connection closes, in seconds.
     #[serde(default = "default_device_ttl")]
@@ -323,8 +332,37 @@ pub struct LimitsConfig {
 
 impl Default for LimitsConfig {
     fn default() -> Self {
-        LimitsConfig { device_ttl: default_device_ttl(), enforce_quota: default_true(), quota_grace: 0 }
+        LimitsConfig {
+            max_handshakes: default_max_handshakes(),
+            max_handshakes_per_ip: default_max_handshakes_per_ip(),
+            handshake_timeout: default_handshake_timeout(),
+            device_ttl: default_device_ttl(),
+            enforce_quota: default_true(),
+            quota_grace: 0,
+        }
     }
+}
+
+impl LimitsConfig {
+    pub fn handshake_limits(&self) -> snell::v6::HandshakeLimits {
+        snell::v6::HandshakeLimits {
+            max_concurrent: self.max_handshakes,
+            max_per_ip: self.max_handshakes_per_ip,
+            timeout: std::time::Duration::from_secs(self.handshake_timeout),
+        }
+    }
+}
+
+fn default_max_handshakes() -> usize {
+    snell::v6::HandshakeLimits::default().max_concurrent
+}
+
+fn default_max_handshakes_per_ip() -> usize {
+    snell::v6::HandshakeLimits::default().max_per_ip
+}
+
+fn default_handshake_timeout() -> u64 {
+    snell::v6::HandshakeLimits::default().timeout.as_secs()
 }
 
 fn default_device_ttl() -> u64 {
@@ -408,6 +446,10 @@ impl Config {
     }
 
     pub fn validate(&mut self) -> Result<(), ConfigError> {
+        self.limits
+            .handshake_limits()
+            .validate()
+            .map_err(|err| ConfigError::InvalidHandshakeLimits(err.to_string()))?;
         if !self.nodes.is_empty() {
             let legacy_node_configured =
                 self.node.listen != default_listen() || self.node.mode != default_mode() || !self.node.psk.is_empty();
@@ -438,7 +480,7 @@ impl Config {
                 }
                 listeners.push(address);
                 if !node.admin.disabled {
-                    if node.admin.token.is_empty() {
+                    if node.admin.token.trim().is_empty() {
                         return Err(ConfigError::InvalidAdminToken(node.name.clone()));
                     }
                     let admin: std::net::SocketAddr =
@@ -465,6 +507,13 @@ impl Config {
                 }
             }
             return Ok(());
+        }
+        if !self.admin.disabled {
+            let address: std::net::SocketAddr =
+                self.admin.listen.parse().map_err(|_| ConfigError::InvalidAdminListen("default".into()))?;
+            if !address.ip().to_canonical().is_loopback() && self.admin.token.trim().is_empty() {
+                return Err(ConfigError::InvalidAdminToken("default".into()));
+            }
         }
         validate_node_credentials(&self.node.psk, &self.node.mode)?;
         let panel = self.panel.as_ref().ok_or(ConfigError::MissingPanel)?;
@@ -527,6 +576,7 @@ pub enum ConfigError {
     Parse(String),
     InvalidPsk(usize),
     InvalidMode(String),
+    InvalidHandshakeLimits(String),
     MissingPanel,
     MixedNodeConfiguration,
     InvalidNodeName(String),
@@ -548,6 +598,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "psk must be 12..=255 bytes long (got {len})")
             }
             ConfigError::InvalidMode(mode) => write!(f, "per-user PSKs require snell v6 default mode (got {mode})"),
+            ConfigError::InvalidHandshakeLimits(message) => {
+                write!(f, "invalid handshake limits: {message}")
+            }
             ConfigError::MissingPanel => {
                 write!(f, "panel configuration is required; standalone mode is no longer supported")
             }
@@ -657,6 +710,30 @@ mod tests {
     }
 
     #[test]
+    fn single_admin_requires_auth_outside_loopback() {
+        let config = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml")).unwrap();
+        for listen in ["0.0.0.0:6161", "[::]:6161", "192.0.2.1:6161", "[::ffff:192.0.2.1]:6161"] {
+            for token in ["", "   "] {
+                let mut candidate = config.clone();
+                candidate.admin.listen = listen.into();
+                candidate.admin.token = token.into();
+                assert!(matches!(candidate.validate(), Err(ConfigError::InvalidAdminToken(_))), "{listen}");
+            }
+        }
+        for listen in ["127.0.0.1:6161", "[::1]:6161", "[::ffff:127.0.0.1]:6161"] {
+            let mut candidate = config.clone();
+            candidate.admin.listen = listen.into();
+            candidate.admin.token.clear();
+            candidate.validate().unwrap();
+        }
+        let mut candidate = config;
+        candidate.admin.listen = "invalid address".into();
+        assert!(matches!(candidate.validate(), Err(ConfigError::InvalidAdminListen(_))));
+        candidate.admin.disabled = true;
+        candidate.validate().unwrap();
+    }
+
+    #[test]
     fn example_config_is_valid() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml");
         let mut config = Config::load(path).expect("example config must parse");
@@ -664,6 +741,38 @@ mod tests {
         assert!(config.node.psk.is_empty());
         config.panel = None;
         assert!(matches!(config.validate(), Err(ConfigError::MissingPanel)));
+    }
+
+    #[test]
+    fn handshake_limits_default_and_validation_cover_single_and_managed_nodes() {
+        let empty: Config = toml::from_str("").unwrap();
+        let partial: Config = toml::from_str("[limits]\ndevice_ttl = 30\n").unwrap();
+        for config in [empty, partial] {
+            assert_eq!(256, config.limits.max_handshakes);
+            assert_eq!(32, config.limits.max_handshakes_per_ip);
+            assert_eq!(10, config.limits.handshake_timeout);
+        }
+        for filename in ["config.example.toml", "config.multi-node.example.toml"] {
+            let path = format!("{}/{filename}", env!("CARGO_MANIFEST_DIR"));
+            let config = Config::load(&path).unwrap();
+            let mut invalid = config.clone();
+            invalid.limits.max_handshakes = 0;
+            assert!(matches!(invalid.validate(), Err(ConfigError::InvalidHandshakeLimits(_))));
+            invalid = config.clone();
+            invalid.limits.handshake_timeout = 0;
+            assert!(matches!(invalid.validate(), Err(ConfigError::InvalidHandshakeLimits(_))));
+            let mut valid = config;
+            valid.limits.max_handshakes = 8;
+            valid.limits.max_handshakes_per_ip = 0;
+            valid.limits.handshake_timeout = 3;
+            valid.validate().unwrap();
+            for node in &valid.nodes {
+                let managed = valid.managed_node_config(node).unwrap();
+                assert_eq!(8, managed.limits.max_handshakes);
+                assert_eq!(0, managed.limits.max_handshakes_per_ip);
+                assert_eq!(3, managed.limits.handshake_timeout);
+            }
+        }
     }
 
     #[test]

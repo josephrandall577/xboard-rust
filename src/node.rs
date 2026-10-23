@@ -199,10 +199,7 @@ impl Node {
                         users = events_rx.recv() => {
                             let Some(_users) = users else { break };
                             // Reload the synchronized users together with their persisted counters.
-                            match events_store.list_users() {
-                                Ok(users) => apply_users(&registry, &server, users).await,
-                                Err(err) => warn!(error = %err, "failed to reload users after ws sync"),
-                            }
+                            apply_users(&registry, &server, || events_store.list_users()).await;
                         }
                     }
                 }
@@ -259,22 +256,25 @@ impl Node {
     }
 }
 
-/// Applies a user set to the registry and the live Snell listener.
+/// Loads and applies users while excluding concurrent accounting flushes.
+/// Acquire the asynchronous listener guard before entering the registry lock.
 async fn apply_users(
     registry: &Registry,
     server: &Arc<RwLock<Option<Arc<SnellServer>>>>,
-    users: Vec<crate::config::User>,
+    load: impl FnOnce() -> Result<Vec<crate::config::User>, crate::store::StoreError>,
 ) {
-    let count = users.len();
     let guard = server.read().await;
-    if let Some(server) = guard.as_ref()
-        && let Err(err) = server.update_users(&users)
-    {
-        warn!(error = %err, "failed to apply users to listener");
-        return;
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = registry.synchronize_users(|| {
+        let users = load()?;
+        if let Some(server) = guard.as_ref() {
+            server.update_users(&users)?;
+        }
+        debug!(users = users.len(), "user set applied");
+        Ok(users)
+    });
+    if let Err(err) = result {
+        warn!(error = %err, "failed to synchronize users");
     }
-    registry.apply_users(&users);
-    debug!(users = count, "user set applied");
 }
 
 async fn pull_loop(
@@ -289,7 +289,7 @@ async fn pull_loop(
     match panel.handshake().await {
         Ok(handshake) => {
             if handshake.websocket.enabled {
-                info!(url = %handshake.websocket.ws_url, "panel supports websocket push; polling remains active");
+                info!("panel supports websocket push; polling remains active");
             }
         }
         Err(err) => log_panel_error("handshake", &err),
@@ -307,17 +307,11 @@ async fn pull_loop(
                     warn!(error = %err, "invalid panel credentials; keeping previous user set");
                     continue;
                 }
-                if let Err(err) = store.replace_users(&users) {
-                    warn!(error = %err, "failed to store panel users");
-                    continue;
-                }
-                match store.list_users() {
-                    Ok(users) => {
-                        apply_users(&registry, &server, users).await;
-                        debug!("panel user sync complete");
-                    }
-                    Err(err) => warn!(error = %err, "failed to load users after sync"),
-                }
+                apply_users(&registry, &server, || {
+                    store.replace_users(&users)?;
+                    store.list_users()
+                })
+                .await;
             }
             Err(err) => log_panel_error("user sync", &err),
         }
@@ -360,10 +354,8 @@ async fn report_pending(panel: &PanelClient, store: &Store, registry: &Registry,
             return;
         }
     };
-    if traffic.is_empty() {
-        return;
-    }
     let result = match panel.api_version() {
+        1 if traffic.is_empty() => Ok(()),
         1 => panel.push_traffic(&traffic).await,
         _ => {
             let online = collect_online(registry);
@@ -372,12 +364,13 @@ async fn report_pending(panel: &PanelClient, store: &Store, registry: &Registry,
             panel.report(&traffic, &alive, &online, system_status(), metrics).await
         }
     };
-    if let Err(err) = result {
-        log_panel_error("traffic report", &err);
-        return;
-    }
-    if let Err(err) = store.acknowledge_traffic(&traffic) {
-        warn!(error = %err, "failed to acknowledge panel traffic");
+    match result {
+        Err(err) => log_panel_error("traffic report", &err),
+        Ok(()) => {
+            if let Err(err) = store.acknowledge_traffic(&traffic) {
+                warn!(error = %err, "failed to acknowledge panel traffic");
+            }
+        }
     }
     if panel.api_version() == 1 {
         if let Err(err) = panel.push_alive(&collect_alive(registry)).await {
@@ -429,4 +422,115 @@ fn current_metrics(registry: &Registry, counters: &Counters, total_users: usize)
         0,
         0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{StatusCode, Uri},
+        routing::post,
+    };
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn user_sync_does_not_overwrite_usage_flushed_while_waiting_for_listener() {
+        let store = Store::open_memory().unwrap();
+        let spec = crate::config::UserSpec {
+            id: 1,
+            uuid: "original-test-user".into(),
+            speed_limit: 0,
+            device_limit: 0,
+            transfer_enable: 100,
+            expired_at: 0,
+            enabled: true,
+        };
+        store.replace_users(&[spec]).unwrap();
+        let registry = Arc::new(Registry::new(Duration::from_secs(60)));
+        registry.apply_users(&store.list_users().unwrap());
+        registry.state(1).unwrap().record_upload(10);
+        let server = Arc::new(RwLock::new(None));
+        let guard = server.write().await;
+        let sync = apply_users(&registry, &server, || {
+            let mut spec = crate::config::UserSpec::from(&store.get_user(1)?.unwrap());
+            spec.uuid = "rotated-test-user".into();
+            store.replace_users(&[spec])?;
+            store.list_users()
+        });
+        tokio::pin!(sync);
+        // Poll exactly to the contended listener lock before flushing usage.
+        tokio::select! {
+            biased;
+            _ = &mut sync => panic!("sync must wait for the listener guard"),
+            _ = std::future::ready(()) => {}
+        }
+        registry.persist_pending(|d| store.stage_traffic(d)).unwrap();
+        drop(guard);
+        sync.await;
+        assert_eq!("rotated-test-user", registry.spec(1).unwrap().uuid);
+        assert_eq!(Some(10), registry.used_bytes(1));
+    }
+
+    #[tokio::test]
+    async fn reports_heartbeat_when_idle_and_after_v1_traffic_failure() {
+        for (version, has_traffic) in [(1, false), (2, false), (1, true)] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let router =
+                Router::new()
+                    .fallback(post(
+                        |State(requests): State<Arc<std::sync::Mutex<Vec<String>>>>,
+                         uri: Uri,
+                         Json(body): Json<Value>| async move {
+                            requests.lock().unwrap().push(uri.path().into());
+                            if uri.path().ends_with("/report") {
+                                assert!(body["status"].is_object());
+                                assert!(body["metrics"].is_object());
+                            }
+                            let status = if uri.path().ends_with("/push") {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::OK
+                            };
+                            (status, Json(json!({"data":true})))
+                        },
+                    ))
+                    .with_state(requests.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config =
+                Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml")).unwrap().panel.unwrap();
+            config.url = format!("http://{}", listener.local_addr().unwrap());
+            config.api_version = version;
+            let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let panel = PanelClient::new(config).unwrap();
+            let store = Store::open_memory().unwrap();
+            let registry = Registry::new(Duration::from_secs(60));
+            let spec = crate::config::UserSpec {
+                id: 1,
+                uuid: "idle-test-user".into(),
+                speed_limit: 0,
+                device_limit: 0,
+                transfer_enable: 0,
+                expired_at: 0,
+                enabled: true,
+            };
+            store.replace_users(&[spec]).unwrap();
+            registry.apply_users(&store.list_users().unwrap());
+            assert!(registry.open_connection(1, "127.0.0.1"));
+            if has_traffic {
+                store.stage_traffic(&[(1, crate::config::Traffic { upload: 3, download: 4 })]).unwrap();
+            }
+            report_pending(&panel, &store, &registry, &Counters::default()).await;
+            let paths = requests.lock().unwrap();
+            if version == 1 {
+                assert!(paths.iter().any(|p| p.ends_with("/alive")), "{paths:?}");
+                assert!(paths.iter().any(|p| p.ends_with("/status")), "{paths:?}");
+            } else {
+                assert_eq!(["/api/v2/server/report"], paths.as_slice());
+            }
+            assert_eq!(has_traffic, !store.pending_traffic().unwrap().is_empty(), "failed traffic must stay queued");
+            task.abort();
+        }
+    }
 }

@@ -4,7 +4,9 @@
 //! verifying its first AEAD record, never by the request's client_id.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,75 @@ const MIN_BLOCK: usize = 32;
 const MAX_BLOCK: usize = 144;
 const READ_STEP: usize = 16;
 const REPLAY_GENERATION: usize = 500_000;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Limits apply to unauthenticated connections, independently per service.
+#[derive(Clone, Copy, Debug)]
+pub struct HandshakeLimits {
+    pub max_concurrent: usize,
+    /// Zero disables the per-IP limit. Unknown source addresses share a bucket.
+    pub max_per_ip: usize,
+    pub timeout: Duration,
+}
+
+impl Default for HandshakeLimits {
+    fn default() -> Self {
+        Self { max_concurrent: 256, max_per_ip: 32, timeout: Duration::from_secs(10) }
+    }
+}
+
+impl HandshakeLimits {
+    pub fn validate(self) -> io::Result<()> {
+        if self.max_concurrent == 0 || self.timeout.is_zero() || Instant::now().checked_add(self.timeout).is_none() {
+            return Err(error::new_invalid(
+                "snell: handshake concurrency and timeout must be positive and representable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct HandshakeCounts {
+    total: usize,
+    by_ip: HashMap<Option<IpAddr>, usize>,
+}
+
+struct HandshakeLimiter {
+    limits: HandshakeLimits,
+    counts: Mutex<HandshakeCounts>,
+}
+
+impl HandshakeLimiter {
+    fn acquire(self: &Arc<Self>, source: &Socksaddr) -> io::Result<HandshakePermit> {
+        let ip = source.addr.map(|ip| ip.to_canonical());
+        let mut counts = self.counts.lock().unwrap();
+        if counts.total >= self.limits.max_concurrent
+            || (self.limits.max_per_ip > 0 && counts.by_ip.get(&ip).copied().unwrap_or(0) >= self.limits.max_per_ip)
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "snell: handshake limit reached"));
+        }
+        counts.total += 1;
+        *counts.by_ip.entry(ip).or_default() += 1;
+        Ok(HandshakePermit { limiter: self.clone(), ip })
+    }
+}
+
+struct HandshakePermit {
+    limiter: Arc<HandshakeLimiter>,
+    ip: Option<IpAddr>,
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        let mut counts = self.limiter.counts.lock().unwrap();
+        counts.total -= 1;
+        let count = counts.by_ip.get_mut(&self.ip).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            counts.by_ip.remove(&self.ip);
+        }
+    }
+}
 
 type UserTable<U> = Arc<RwLock<Arc<CredentialTable<U>>>>;
 
@@ -41,6 +111,51 @@ impl<U> Default for CredentialTable<U> {
 }
 
 impl<U> CredentialTable<U> {
+    fn build(users: Vec<U>, psks: Vec<Vec<u8>>, previous: &Self) -> io::Result<Self> {
+        if users.len() != psks.len() {
+            return Err(error::new_invalid("snell: user/psk count mismatch"));
+        }
+        let mut next = Self::default();
+        next.by_psk.reserve(users.len());
+        for (user, psk) in users.into_iter().zip(psks) {
+            if !(12..=255).contains(&psk.len()) {
+                return Err(error::new_invalid("snell: user psk length must be between 12 and 255 bytes"));
+            }
+            if next.by_psk.contains_key(&psk) {
+                return Err(error::new_invalid("snell: duplicate user psk"));
+            }
+            let framing = match previous.by_psk.get(&psk) {
+                Some(entry) => entry.framing.clone(),
+                None => Framing {
+                    mode: Mode::Default,
+                    profile: Some(Arc::new(Profile::new(&psk))),
+                    psk: psk.clone().into(),
+                },
+            };
+            let fingerprint = match previous.by_psk.get(&psk) {
+                Some(entry) => entry.fingerprint.clone(),
+                None => framing.profile.as_ref().unwrap().salt_fingerprint(),
+            };
+            if fingerprint.len() < 16 {
+                return Err(error::new_invalid("snell: insufficient salt-block fingerprint"));
+            }
+            let block_len = framing.profile.as_ref().unwrap().salt_block_len;
+            if !(MIN_BLOCK..=MAX_BLOCK).contains(&block_len) {
+                return Err(error::new_invalid("snell: unsupported salt block length"));
+            }
+            // A mismatch at a position fixed by BOTH profiles proves they can
+            // never select each other, for any salt. Check all block lengths:
+            // a shorter fingerprint could otherwise shadow a longer profile.
+            if next.by_psk.values().any(|entry| fingerprints_overlap(&fingerprint, &entry.fingerprint)) {
+                return Err(error::new_invalid("snell: ambiguous user psk fingerprints; keeping previous credentials"));
+            }
+            let entry = Arc::new(Credential { user, framing, fingerprint });
+            next.by_length[block_len - MIN_BLOCK].push(entry.clone());
+            next.by_psk.insert(psk, entry);
+        }
+        Ok(next)
+    }
+
     fn identify(&self, block: &[u8], checked: &mut usize) -> Option<Arc<Credential<U>>> {
         while *checked <= block.len() {
             for entry in &self.by_length[*checked - MIN_BLOCK] {
@@ -52,6 +167,34 @@ impl<U> CredentialTable<U> {
         }
         None
     }
+}
+
+// Fingerprints contain sorted (offset, byte) pairs; omitted positions are
+// wildcards. Disjoint fixed positions, too, can match the same byte stream.
+fn fingerprints_overlap(first: &[(usize, u8)], second: &[(usize, u8)]) -> bool {
+    let (mut a, mut b) = (0, 0);
+    while a < first.len() && b < second.len() {
+        match first[a].0.cmp(&second[b].0) {
+            std::cmp::Ordering::Less => a += 1,
+            std::cmp::Ordering::Greater => b += 1,
+            std::cmp::Ordering::Equal => {
+                if first[a].1 != second[b].1 {
+                    return false;
+                }
+                a += 1;
+                b += 1;
+            }
+        }
+    }
+    true
+}
+
+/// Validate a full default-mode PSK set before persisting a panel snapshot.
+/// Errors never include PSK bytes. This also detects potential prefix overlap
+/// across different salt-block lengths, conservatively rejecting ambiguity.
+pub fn validate_psks<'a>(psks: impl IntoIterator<Item = &'a [u8]>) -> io::Result<()> {
+    let psks: Vec<_> = psks.into_iter().map(<[u8]>::to_vec).collect();
+    CredentialTable::build(vec![(); psks.len()], psks, &CredentialTable::default()).map(|_| ())
 }
 
 struct Credential<U> {
@@ -92,65 +235,43 @@ pub struct MultiPskService<U> {
     users: UserTable<U>,
     handler: Arc<dyn Handler>,
     replay: Arc<Mutex<ReplayCache>>,
+    handshakes: Arc<HandshakeLimiter>,
 }
 
 impl<U> Clone for MultiPskService<U> {
     fn clone(&self) -> Self {
-        Self { users: self.users.clone(), handler: self.handler.clone(), replay: self.replay.clone() }
+        Self {
+            users: self.users.clone(),
+            handler: self.handler.clone(),
+            replay: self.replay.clone(),
+            handshakes: self.handshakes.clone(),
+        }
     }
 }
 
 impl<U: Clone + Send + Sync + 'static> MultiPskService<U> {
     pub fn new(mode: Mode, handler: Arc<dyn Handler>) -> io::Result<Self> {
+        Self::with_handshake_limits(mode, handler, HandshakeLimits::default())
+    }
+
+    pub fn with_handshake_limits(mode: Mode, handler: Arc<dyn Handler>, limits: HandshakeLimits) -> io::Result<Self> {
         if mode != Mode::Default {
             return Err(error::new_invalid("snell: per-user PSKs require v6 default mode"));
         }
+        limits.validate()?;
         Ok(Self {
             users: Arc::new(RwLock::new(Arc::new(CredentialTable::default()))),
             handler,
             replay: Arc::new(Mutex::new(ReplayCache::default())),
+            handshakes: Arc::new(HandshakeLimiter { limits, counts: Mutex::default() }),
         })
     }
 
     /// Validates and atomically replaces credentials. Unchanged PSKs reuse the
     /// existing profile and fingerprint; no Argon2 derivation happens here.
     pub fn update_users(&self, users: Vec<U>, psks: Vec<Vec<u8>>) -> io::Result<()> {
-        if users.len() != psks.len() {
-            return Err(error::new_invalid("snell: user/psk count mismatch"));
-        }
         let previous = self.users.read().unwrap().clone();
-        let mut next = CredentialTable::default();
-        next.by_psk.reserve(users.len());
-        for (user, psk) in users.into_iter().zip(psks) {
-            if !(12..=255).contains(&psk.len()) {
-                return Err(error::new_invalid("snell: user psk length must be between 12 and 255 bytes"));
-            }
-            if next.by_psk.contains_key(&psk) {
-                return Err(error::new_invalid("snell: duplicate user psk"));
-            }
-            let framing = match previous.by_psk.get(&psk) {
-                Some(entry) => entry.framing.clone(),
-                None => Framing {
-                    mode: Mode::Default,
-                    profile: Some(Arc::new(Profile::new(&psk))),
-                    psk: psk.clone().into(),
-                },
-            };
-            let fingerprint = match previous.by_psk.get(&psk) {
-                Some(entry) => entry.fingerprint.clone(),
-                None => framing.profile.as_ref().unwrap().salt_fingerprint(),
-            };
-            if fingerprint.len() < 16 {
-                return Err(error::new_invalid("snell: insufficient salt-block fingerprint"));
-            }
-            let block_len = framing.profile.as_ref().unwrap().salt_block_len;
-            if !(MIN_BLOCK..=MAX_BLOCK).contains(&block_len) {
-                return Err(error::new_invalid("snell: unsupported salt block length"));
-            }
-            let entry = Arc::new(Credential { user, framing, fingerprint });
-            next.by_length[block_len - MIN_BLOCK].push(entry.clone());
-            next.by_psk.insert(psk, entry);
-        }
+        let next = CredentialTable::build(users, psks, &previous)?;
         *self.users.write().unwrap() = Arc::new(next);
         Ok(())
     }
@@ -162,10 +283,30 @@ impl<U: Clone + Send + Sync + 'static> MultiPskService<U> {
         source: Socksaddr,
         on_close: Option<CloseHandler>,
     ) -> Result<(), ServerError> {
-        self.serve(ctx, conn.clone(), source.clone(), on_close).await.map_err(|cause| ServerError {
-            conn,
-            source,
-            cause,
+        match self.accept_connection(ctx, conn.clone(), source.clone(), on_close) {
+            Ok(connection) => connection.await,
+            Err(cause) => Err(ServerError { conn, source, cause }),
+        }
+    }
+
+    /// Reserve capacity synchronously, BEFORE spawning a connection task.
+    /// Saturation rejects immediately without queuing tasks or reading bytes.
+    /// Dropping the returned future releases its reservation even if unpolled.
+    pub fn accept_connection(
+        &self,
+        ctx: Context,
+        conn: Arc<dyn Conn>,
+        source: Socksaddr,
+        on_close: Option<CloseHandler>,
+    ) -> io::Result<impl Future<Output = Result<(), ServerError>> + Send + 'static + use<U>> {
+        let permit = self.handshakes.acquire(&source)?;
+        let started = tokio::time::Instant::now();
+        let service = self.clone();
+        Ok(async move {
+            service
+                .serve(ctx, conn.clone(), source.clone(), on_close, permit, started)
+                .await
+                .map_err(|cause| ServerError { conn, source, cause })
         })
     }
 
@@ -175,10 +316,17 @@ impl<U: Clone + Send + Sync + 'static> MultiPskService<U> {
         conn: Arc<dyn Conn>,
         source: Socksaddr,
         on_close: Option<CloseHandler>,
+        permit: HandshakePermit,
+        started: tokio::time::Instant,
     ) -> io::Result<()> {
-        let (entry, conn, reader, record) = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.read_hello(&conn))
+        let remaining = self.handshakes.limits.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "snell: psk handshake timed out"));
+        }
+        let (entry, conn, reader, record) = tokio::time::timeout(remaining, self.read_hello(&conn))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "snell: psk handshake timed out"))??;
+        drop(permit);
         let users = self.users.clone();
         let psk = entry.framing.psk.clone();
         let service = Arc::new(ServiceInner {
@@ -339,6 +487,8 @@ mod tests {
         max_read: usize,
         output: CaptureConn,
         requests: Mutex<Vec<usize>>,
+        read_delay: Duration,
+        blocked_write: Option<tokio::sync::Notify>,
     }
     impl Input {
         fn new(bytes: Vec<u8>, max_read: usize) -> Self {
@@ -347,17 +497,26 @@ mod tests {
                 max_read,
                 output: CaptureConn::default(),
                 requests: Mutex::new(Vec::new()),
+                read_delay: Duration::ZERO,
+                blocked_write: None,
             }
         }
     }
     #[async_trait]
     impl Conn for Input {
         async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.read_delay.is_zero() {
+                tokio::time::sleep(self.read_delay).await;
+            }
             self.requests.lock().unwrap().push(buf.len());
             let size = buf.len().min(self.max_read);
             std::io::Read::read(&mut *self.bytes.lock().unwrap(), &mut buf[..size])
         }
         async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(writing) = &self.blocked_write {
+                writing.notify_one();
+                return std::future::pending().await;
+            }
             self.output.write(buf).await
         }
         async fn close(&self) -> io::Result<()> {
@@ -385,8 +544,199 @@ mod tests {
     }
 
     fn service() -> (MultiPskService<usize>, tokio::sync::mpsc::UnboundedReceiver<usize>) {
+        service_with_limits(HandshakeLimits::default())
+    }
+
+    fn service_with_limits(
+        limits: HandshakeLimits,
+    ) -> (MultiPskService<usize>, tokio::sync::mpsc::UnboundedReceiver<usize>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (MultiPskService::new(Mode::Default, Arc::new(IdHandler(tx))).unwrap(), rx)
+        (MultiPskService::with_handshake_limits(Mode::Default, Arc::new(IdHandler(tx)), limits).unwrap(), rx)
+    }
+
+    #[test]
+    fn detects_masked_and_cross_length_fingerprint_ambiguity() {
+        // Complementary salt positions: no common fixed bytes, but both
+        // fingerprints can match the same 32-byte salt block.
+        let even: Vec<_> = (0..32).step_by(2).map(|i| (i, 42)).collect();
+        let odd: Vec<_> = (1..32).step_by(2).map(|i| (i, 99)).collect();
+        assert!(fingerprints_overlap(&even, &odd));
+        assert!(fingerprints_overlap(&even, &even));
+        let mut longer = even.clone();
+        longer.push((40, 7));
+        assert!(fingerprints_overlap(&even, &longer));
+        assert!(fingerprints_overlap(&longer, &even));
+        longer[5].1 ^= 1;
+        assert!(!fingerprints_overlap(&even, &longer));
+        assert!(!fingerprints_overlap(&longer, &even));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_replacement_keeps_previous_snapshot_and_authentication() {
+        let (service, mut ids) = service();
+        let psk = b"alice-unique-psk".to_vec();
+        service.update_users(vec![1], vec![psk.clone()]).unwrap();
+        let previous = service.users.read().unwrap().clone();
+        let existing = previous.by_psk.get(&psk).unwrap();
+        // Supply deliberately overlapping cached profiles. This exercises the
+        // update boundary without relying on finding actual PSK hash collisions.
+        for same_length in [true, false] {
+            let other = (0..1000)
+                .map(|i| format!("collision-test-psk-{i}").into_bytes())
+                .find(|key| {
+                    (Profile::new(key).salt_block_len == existing.framing.profile.as_ref().unwrap().salt_block_len)
+                        == same_length
+                })
+                .unwrap();
+            let mut cached = CredentialTable::default();
+            cached.by_psk.insert(psk.clone(), existing.clone());
+            cached.by_psk.insert(
+                other.clone(),
+                Arc::new(Credential { user: 2, framing: framing(&other), fingerprint: existing.fingerprint.clone() }),
+            );
+            cached.by_length[existing.framing.profile.as_ref().unwrap().salt_block_len - MIN_BLOCK]
+                .push(existing.clone());
+            let cached = Arc::new(cached);
+            *service.users.write().unwrap() = cached.clone();
+            let err = service.update_users(vec![1, 2], vec![psk.clone(), other.clone()]).unwrap_err();
+            assert!(err.to_string().contains("ambiguous"));
+            for key in [&psk, &other] {
+                assert!(!err.to_string().contains(std::str::from_utf8(key).unwrap()));
+            }
+            assert!(Arc::ptr_eq(&cached, &service.users.read().unwrap()));
+            service
+                .new_connection(
+                    Context::new(),
+                    Arc::new(Input::new(hello(&psk, COMMAND_CONNECT, b"").await, 144)),
+                    Socksaddr::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(Some(1), ids.recv().await);
+        }
+    }
+
+    #[test]
+    fn validates_psks_before_persistence() {
+        assert!(validate_psks(std::iter::empty()).is_ok());
+        assert!(validate_psks([b"alice-unique-psk".as_slice(), b"bob-unique-psk".as_slice()]).is_ok());
+        assert!(validate_psks([b"alice-unique-psk".as_slice(); 2]).is_err());
+        assert!(validate_psks([b"short".as_slice()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn admission_is_bounded_before_polling_and_shared_by_clones() {
+        let limits = HandshakeLimits { max_concurrent: 2, max_per_ip: 1, ..Default::default() };
+        let (service, _) = service_with_limits(limits);
+        let clone = service.clone();
+        let input = Arc::new(Input::new(vec![], 1));
+        let source = Socksaddr::parse("192.0.2.1:1000");
+        let first = service.accept_connection(Context::new(), input.clone(), source.clone(), None).unwrap();
+        // Neither mapped IPv4 nor a new source port gets a fresh IP bucket.
+        for address in ["192.0.2.1:2000", "[::ffff:192.0.2.1]:3000"] {
+            let result = clone.accept_connection(Context::new(), input.clone(), Socksaddr::parse(address), None);
+            assert_eq!(io::ErrorKind::WouldBlock, result.err().unwrap().kind());
+        }
+        let second =
+            clone.accept_connection(Context::new(), input.clone(), Socksaddr::parse("192.0.2.2:1"), None).unwrap();
+        let third = service.accept_connection(Context::new(), input.clone(), Socksaddr::parse("192.0.2.3:1"), None);
+        assert_eq!(io::ErrorKind::WouldBlock, third.err().unwrap().kind());
+        assert!(input.requests.lock().unwrap().is_empty(), "admission must not read any bytes");
+        // Separate nodes have independent budgets.
+        let (other, _) = service_with_limits(limits);
+        let independent = other.accept_connection(Context::new(), input.clone(), source.clone(), None).unwrap();
+        drop(independent);
+        drop(first);
+        let replacement = clone.accept_connection(Context::new(), input, source, None).unwrap();
+        drop(replacement);
+        drop(second);
+        assert_eq!(0, service.handshakes.counts.lock().unwrap().total);
+        assert!(service.handshakes.counts.lock().unwrap().by_ip.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_does_not_extend_deadline_and_timeout_releases_capacity() {
+        let (service, _) = service_with_limits(HandshakeLimits {
+            max_concurrent: 1,
+            timeout: Duration::from_secs(3),
+            ..Default::default()
+        });
+        service.update_users(vec![1], vec![b"alice-unique-psk".to_vec()]).unwrap();
+        let input = Arc::new(Input {
+            read_delay: Duration::from_secs(1),
+            ..Input::new(hello(b"alice-unique-psk", COMMAND_CONNECT, b"").await, 1)
+        });
+        let start = tokio::time::Instant::now();
+        let err = service.new_connection(Context::new(), input.clone(), Socksaddr::default(), None).await.unwrap_err();
+        assert_eq!(io::ErrorKind::TimedOut, err.cause.kind());
+        assert_eq!(Duration::from_secs(3), start.elapsed());
+        assert!(!input.requests.lock().unwrap().is_empty(), "slow client should have made progress");
+        assert!(service.handshakes.counts.lock().unwrap().by_ip.is_empty());
+        let next = service.accept_connection(Context::new(), input, Socksaddr::default(), None).unwrap();
+        drop(next);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_delay_counts_towards_deadline_and_cancellation_releases_capacity() {
+        let (service, _) = service_with_limits(HandshakeLimits { max_concurrent: 1, ..Default::default() });
+        service.update_users(vec![1], vec![b"alice-unique-psk".to_vec()]).unwrap();
+        let input = Arc::new(Input::new(hello(b"alice-unique-psk", COMMAND_CONNECT, b"").await, 144));
+        let pending = service.accept_connection(Context::new(), input.clone(), Socksaddr::default(), None).unwrap();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert_eq!(io::ErrorKind::TimedOut, pending.await.unwrap_err().cause.kind());
+        assert!(input.requests.lock().unwrap().is_empty(), "expired admission must reject before reading");
+        let slow = Arc::new(Input { read_delay: Duration::from_secs(1), ..Input::new(vec![], 1) });
+        let pending = service.accept_connection(Context::new(), slow, Socksaddr::default(), None).unwrap();
+        let task = tokio::spawn(pending);
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(service.handshakes.counts.lock().unwrap().by_ip.is_empty());
+        let pending = service.accept_connection(Context::new(), input, Socksaddr::default(), None).unwrap();
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn verified_connections_release_capacity_before_response_or_relay() {
+        let (service, _) = service_with_limits(HandshakeLimits { max_concurrent: 1, ..Default::default() });
+        let psk = b"alice-unique-psk".to_vec();
+        service.update_users(vec![1], vec![psk.clone()]).unwrap();
+        let input = Arc::new(Input {
+            blocked_write: Some(tokio::sync::Notify::new()),
+            ..Input::new(hello(&psk, COMMAND_PING, b"").await, 144)
+        });
+        let pending = service.accept_connection(Context::new(), input.clone(), Socksaddr::default(), None).unwrap();
+        let task = tokio::spawn(pending);
+        tokio::time::timeout(Duration::from_secs(5), input.blocked_write.as_ref().unwrap().notified()).await.unwrap();
+        let next = service.accept_connection(Context::new(), input, Socksaddr::default(), None).unwrap();
+        drop(next);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(service.handshakes.counts.lock().unwrap().by_ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_handshakes_release_capacity_and_zero_per_ip_disables_only_that_limit() {
+        let (service, _) =
+            service_with_limits(HandshakeLimits { max_concurrent: 2, max_per_ip: 0, ..Default::default() });
+        let psk = b"alice-unique-psk".to_vec();
+        service.update_users(vec![1], vec![psk.clone()]).unwrap();
+        let valid = hello(&psk, COMMAND_CONNECT, b"").await;
+        let mut tampered = valid.clone();
+        tampered[Profile::new(&psk).salt_block_len + Profile::new(&psk).record_prefix_len(0)] ^= 1;
+        for bytes in [valid[..31].to_vec(), vec![0; MAX_BLOCK], tampered] {
+            let err = service
+                .new_connection(Context::new(), Arc::new(Input::new(bytes, 144)), Socksaddr::default(), None)
+                .await;
+            assert!(err.is_err());
+            assert!(service.handshakes.counts.lock().unwrap().by_ip.is_empty());
+        }
+        let input = Arc::new(Input::new(vec![], 1));
+        let first = service.accept_connection(Context::new(), input.clone(), Socksaddr::default(), None).unwrap();
+        let second = service.accept_connection(Context::new(), input.clone(), Socksaddr::default(), None).unwrap();
+        assert!(service.accept_connection(Context::new(), input, Socksaddr::default(), None).is_err());
+        drop((first, second));
     }
 
     #[test]
@@ -494,6 +844,16 @@ mod tests {
         for mode in [Mode::Unshaped, Mode::UnsafeRaw] {
             assert!(MultiPskService::<usize>::new(mode, Arc::new(IdHandler(tx.clone()))).is_err());
         }
+        for limits in [
+            HandshakeLimits { max_concurrent: 0, ..Default::default() },
+            HandshakeLimits { timeout: Duration::ZERO, ..Default::default() },
+            HandshakeLimits { timeout: Duration::MAX, ..Default::default() },
+        ] {
+            assert!(
+                MultiPskService::<usize>::with_handshake_limits(Mode::Default, Arc::new(IdHandler(tx.clone())), limits)
+                    .is_err()
+            );
+        }
         let (service, _) = service();
         for len in [0, 11, 256] {
             assert!(service.update_users(vec![1], vec![vec![b'a'; len]]).is_err());
@@ -536,6 +896,13 @@ mod tests {
         let start = Instant::now();
         service.update_users((0..psks.len()).collect(), psks.clone()).unwrap();
         eprintln!("1000 profile/fingerprint registrations: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        validate_psks(psks.iter().map(Vec::as_slice)).unwrap();
+        eprintln!("1000-user panel snapshot validation: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0);
+        let start = Instant::now();
+        service.update_users((0..psks.len()).collect(), psks.clone()).unwrap();
+        eprintln!("1000-user unchanged snapshot update: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0);
 
         let users = service.users.read().unwrap().clone();
         let noise = [0xa5; MAX_BLOCK];

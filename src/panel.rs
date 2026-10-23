@@ -43,7 +43,7 @@ impl std::error::Error for PanelError {}
 
 impl From<reqwest::Error> for PanelError {
     fn from(err: reqwest::Error) -> Self {
-        PanelError::Request(err)
+        PanelError::Request(err.without_url())
     }
 }
 
@@ -97,6 +97,7 @@ pub struct PanelClient {
 
 impl PanelClient {
     pub fn new(config: PanelConfig) -> Result<PanelClient, PanelError> {
+        warn_insecure_transport(&config.url);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(concat!("xboard-snell/", env!("CARGO_PKG_VERSION")))
@@ -279,9 +280,32 @@ impl PanelClient {
     }
 }
 
+/// Keep cleartext configurations compatible, but make credential exposure
+/// visible. Never log the endpoint: it may already contain a secret query.
+pub(crate) fn warn_insecure_transport(endpoint: &str) {
+    if let Ok(url) = url::Url::parse(endpoint) {
+        let loopback = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.to_canonical().is_loopback(),
+            _ => false,
+        };
+        if matches!(url.scheme(), "http" | "ws") && !loopback {
+            warn!("panel transport is unencrypted; tokens and user PSKs can be exposed; use HTTPS/WSS");
+        }
+    }
+}
+
 fn truncate(body: &str) -> String {
     const LIMIT: usize = 4096;
-    if body.len() <= LIMIT { body.to_string() } else { format!("{}…", &body[..LIMIT]) }
+    if body.len() <= LIMIT {
+        body.to_string()
+    } else {
+        let mut end = LIMIT;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &body[..end])
+    }
 }
 
 #[derive(Deserialize)]

@@ -10,4 +10,8 @@ tests, and the corresponding example resolver and documentation changes.
 
 The v6 multi-PSK service is a local extension for XBoard: default-mode salt-block
 fingerprints select a credential, and AEAD verification establishes identity.
+Local hardening rejects potentially overlapping fingerprints before replacing
+credentials and bounds unauthenticated handshakes per service and source IP.
+The node reserves handshake capacity before spawning connection tasks and
+releases it after first-record authentication, failure, timeout or cancellation.
 Existing single-PSK and client-ID library services remain available for interop.

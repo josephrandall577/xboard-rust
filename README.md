@@ -1,7 +1,7 @@
 # xboard-snell
 
-Current release: **v2.0.0**. This major release switches client authentication to
-independent per-user PSKs. Read the [migration notes](RELEASE_NOTES_v2.0.0.md) before upgrading.
+Current release: **[v2.0.1](RELEASE_NOTES_v2.0.1.md)**, with authentication, accounting
+and reporting fixes. Read the [migration guide](docs/upgrading.md) when upgrading from v1.
 
 An Xboard-compatible Snell v6 landing server built on the vendored
 [`snell`](snell/) crate from [snell-in-rust](https://github.com/josephrandall577/snell-in-rust),
@@ -272,6 +272,10 @@ cp config.example.toml config.toml
 
 ## Xboard setup
 
+Use HTTPS for the panel URL and WSS for optional WebSocket push. Remote HTTP/WS
+remains compatible and emits a warning, but transmits tokens and user PSKs in
+cleartext. A warning does not encrypt that traffic.
+
 1. Add a node in Xboard. The backend only needs a token and node id.
 2. Start the node with the matching `[panel]` block.
 3. Point each user's Snell client at `listen`, using that user's `uuid` as
@@ -281,11 +285,15 @@ cp config.example.toml config.toml
 MySnell = snell, node.example.com, 6160, psk=YOUR_PANEL_USER_UUID, version=6
 ~~~
 
-Each user UUID must be unique and 12–255 bytes long. Only `mode = "default"`
+Each user UUID must be unique and 12–255 bytes long. A snapshot containing
+ambiguous PSK fingerprints is rejected in full, leaving the previous credentials
+active. Regenerate the newly added or changed UUID and retry; see
+[credential validation](docs/multi-psk-validation.md). Only `mode = "default"`
 is accepted. The optional legacy `[node].psk` / `[[nodes]].psk` setting is
 ignored; it grants no access. All client subscriptions must switch from the
 old shared PSK to the individual user's UUID. This node does not generate
 panel subscriptions; ensure the panel's Surge template emits that UUID as PSK.
+See the [XBoard integration guide](docs/xboard-v2-update-guide.md) for the API contract.
 
 The selector reads 32 bytes first, then advances in 16-byte steps up to 144 bytes.
 At each step it checks all newly covered salt-block lengths (not only multiples
@@ -293,8 +301,25 @@ of 16), compares the deterministic non-salt bytes, feeds any overread
 record prefix back into the connection, then derives one AEAD key. The fingerprint
 is a selector, not an authentication tag; the payload must pass AEAD verification.
 Do not treat the number of matched bytes as a measured cross-profile collision
-probability: shaped padding is not uniformly random. Handshakes time out after
-10 seconds. Profile/fingerprint state is reused on unchanged user updates.
+probability: shaped padding is not uniformly random. User snapshots are checked
+for overlapping fingerprints, including different block lengths and salt
+positions. A shared fixed position with different bytes proves two fingerprints
+cannot overlap; otherwise the snapshot is conservatively rejected. Poll and
+WebSocket updates validate before storage and keep the previous snapshot on
+failure. Checks compare profile pairs (quadratic in user count) during updates,
+not on the connection path. Unchanged credentials reuse cached profiles in the
+live service.
+
+The `[limits]` settings `max_handshakes = 256`,
+`max_handshakes_per_ip = 32` and `handshake_timeout = 10` bound unauthenticated
+connections independently per node. Capacity is reserved before spawning a task;
+excess connections close immediately without waiting in an application queue.
+The timeout is an absolute budget from admission and is not reset by partial
+reads. Capacity is released after the first authenticated record, on failure,
+timeout or cancellation; established relays do not count. IPv4-mapped IPv6
+sources share the IPv4 bucket. Increase the per-IP limit for shared NATs, or set
+it to `0` to disable that additional limit. The global limit and timeout must
+remain positive. These concurrency limits do not impose a connection rate cap.
 
 To measure precomputation, a full 1000-user fingerprint scan of buffered bytes,
 and one Argon2id derivation on the deployment hardware:
@@ -338,7 +363,9 @@ can authenticate until the first successful panel user sync.
 ## Admin API
 
 `[admin].listen` (default `127.0.0.1:6161`). If `[admin].token` is set, send
-`Authorization: Bearer <token>`.
+`Authorization: Bearer <token>`. Single-node configurations may omit the token
+only on a literal loopback address; external listeners require a nonblank token.
+Managed nodes always require a token when the admin API is enabled.
 
 | Method | Path | Description |
 | --- | --- | --- |

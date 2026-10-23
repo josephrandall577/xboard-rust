@@ -12,7 +12,6 @@ use xboard_snell::config::{AdminConfig, Config, ManagedNodeConfig, NodeConfig, P
 use xboard_snell::node::Node;
 
 const PSK: &str = "integration-test-psk-0123456789";
-const MODES: [&str; 1] = ["default"];
 
 struct Harness {
     node: Arc<Node>,
@@ -22,7 +21,7 @@ struct Harness {
 }
 
 impl Harness {
-    async fn start(mode: &str, users: Vec<UserSpec>) -> Harness {
+    async fn start(users: Vec<UserSpec>) -> Harness {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_test_writer().try_init();
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("node.db");
@@ -44,7 +43,7 @@ impl Harness {
             );
         let panel_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Config {
-            node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: mode.into() },
+            node: NodeConfig { listen: "127.0.0.1:0".into(), psk: PSK.into(), mode: "default".into() },
             panel: Some(PanelConfig {
                 url: panel_url,
                 token: "test-panel-token".into(),
@@ -152,25 +151,23 @@ async fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v6_round_trip_is_metered_per_user() {
-    for mode in MODES {
-        let harness = Harness::start(mode, vec![spec(1, "alice-key-unique-psk")]).await;
-        let client = harness.client("alice-key-unique-psk");
-        let payload = vec![0x42u8; 8 * 1024];
-        let received = round_trip(&client, &harness.address, &payload).await.unwrap();
-        assert_eq!(payload, received, "mode {mode}");
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk")]).await;
+    let client = harness.client("alice-key-unique-psk");
+    let payload = vec![0x42u8; 8 * 1024];
+    let received = round_trip(&client, &harness.address, &payload).await.unwrap();
+    assert_eq!(payload, received);
 
-        let state = harness.node.registry.state(1).expect("user registered");
-        wait_until(Duration::from_secs(5), || state.totals().total() >= payload.len() as u64).await;
-        let totals = state.totals();
-        assert_eq!(totals.upload, payload.len() as u64, "mode {mode} upload");
-        assert_eq!(totals.download, payload.len() as u64, "mode {mode} download");
-        harness.shutdown().await;
-    }
+    let state = harness.node.registry.state(1).expect("user registered");
+    wait_until(Duration::from_secs(5), || state.totals().total() >= payload.len() as u64).await;
+    let totals = state.totals();
+    assert_eq!(totals.upload, payload.len() as u64);
+    assert_eq!(totals.download, payload.len() as u64);
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_psk_is_rejected() {
-    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk")]).await;
     let client = harness.client("mallory-key-unique-psk");
     let result = round_trip(&client, &harness.address, b"nope").await;
     assert!(result.is_err(), "unauthenticated user must be refused: {result:?}");
@@ -179,7 +176,7 @@ async fn unknown_psk_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peers_are_metered_independently() {
-    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
     let alice = harness.client("alice-key-unique-psk");
     let bob = harness.client("bob-key-unique-psk");
     round_trip(&alice, &harness.address, &vec![1u8; 2048]).await.unwrap();
@@ -195,7 +192,7 @@ async fn peers_are_metered_independently() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn traffic_is_persisted_to_store() {
-    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk")]).await;
     let client = harness.client("alice-key-unique-psk");
     round_trip(&client, &harness.address, &vec![7u8; 4096]).await.unwrap();
     // Wait for the panel report (10s) to persist traffic.
@@ -212,7 +209,7 @@ async fn traffic_is_persisted_to_store() {
 async fn device_limit_refuses_extra_source_ips() {
     let mut user = spec(1, "alice-key-unique-psk");
     user.device_limit = 1;
-    let harness = Harness::start("default", vec![user]).await;
+    let harness = Harness::start(vec![user]).await;
     let client = harness.client("alice-key-unique-psk");
     // The first connection from 127.0.0.1 registers the device.
     round_trip(&client, &harness.address, b"first").await.unwrap();
@@ -232,7 +229,7 @@ async fn device_limit_refuses_extra_source_ips() {
 async fn expired_user_is_refused() {
     let mut user = spec(1, "alice-key-unique-psk");
     user.expired_at = xboard_snell::config::unix_now() - 1;
-    let harness = Harness::start("default", vec![user]).await;
+    let harness = Harness::start(vec![user]).await;
     let client = harness.client("alice-key-unique-psk");
     let result = round_trip(&client, &harness.address, b"expired").await;
     assert!(result.is_err(), "expired user must be refused");
@@ -243,7 +240,7 @@ async fn expired_user_is_refused() {
 async fn quota_exhausted_user_is_refused() {
     let mut user = spec(1, "alice-key-unique-psk");
     user.transfer_enable = 1;
-    let harness = Harness::start("default", vec![user]).await;
+    let harness = Harness::start(vec![user]).await;
     // Mark the quota as fully used before the connection is attempted.
     harness.node.store.add_traffic(&[(1, xboard_snell::config::Traffic { upload: 1, download: 0 })]).unwrap();
     harness.node.registry.apply_users(&harness.node.store.list_users().unwrap());
@@ -294,67 +291,63 @@ async fn limited_tcp_transfer(harness: &Harness, seed: u8) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn limited_tcp_preserves_concurrent_streams() {
-    for mode in MODES {
-        let mut user = spec(1, "limited-key-unique-psk");
-        user.speed_limit = 1;
-        let harness = Harness::start(mode, vec![user]).await;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(limited_tcp_transfer(&harness, 1), limited_tcp_transfer(&harness, 2));
-        })
-        .await
-        .expect("limited TCP transfers must finish");
-        let totals = harness.node.registry.state(1).unwrap().totals();
-        assert_eq!(256 * 1024, totals.upload, "mode {mode} upload accounting");
-        assert_eq!(256 * 1024, totals.download, "mode {mode} download accounting");
-        harness.shutdown().await;
-    }
+    let mut user = spec(1, "limited-key-unique-psk");
+    user.speed_limit = 1;
+    let harness = Harness::start(vec![user]).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(limited_tcp_transfer(&harness, 1), limited_tcp_transfer(&harness, 2));
+    })
+    .await
+    .expect("limited TCP transfers must finish");
+    let totals = harness.node.registry.state(1).unwrap().totals();
+    assert_eq!(256 * 1024, totals.upload, "upload accounting");
+    assert_eq!(256 * 1024, totals.download, "download accounting");
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn limited_udp_preserves_complete_datagrams() {
-    for mode in MODES {
-        let mut user = spec(1, "limited-key-unique-psk");
-        user.speed_limit = 1;
-        let harness = Harness::start(mode, vec![user]).await;
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let destination = socket.local_addr().unwrap();
-        let target = tokio::spawn(async move {
-            let mut packets = Vec::new();
-            let mut buffer = vec![0; 65536];
-            for size in [4096, 8192] {
-                let (n, source) =
-                    tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await.unwrap().unwrap();
-                packets.push(buffer[..n].to_vec());
-                socket.send_to(&vec![0x73; size], source).await.unwrap();
-            }
-            packets
-        });
-        let proxy = harness.client("limited-key-unique-psk").dial_packet_conn(dial(&harness.address).await).unwrap();
-        proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(10))).unwrap();
-        let mut replies = Vec::new();
+    let mut user = spec(1, "limited-key-unique-psk");
+    user.speed_limit = 1;
+    let harness = Harness::start(vec![user]).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = socket.local_addr().unwrap();
+    let target = tokio::spawn(async move {
+        let mut packets = Vec::new();
+        let mut buffer = vec![0; 65536];
         for size in [4096, 8192] {
-            let payload = vec![0x35; size];
-            let packet = Buffer::from_slice_with_headroom(&payload, proxy.front_headroom(), proxy.rear_headroom());
-            proxy.write_packet(packet, destination.into()).await.unwrap();
-            let mut reply = Buffer::new_packet();
-            let source = proxy.read_packet(&mut reply).await.unwrap();
-            assert_eq!(size, reply.len(), "mode {mode} UDP download length");
-            assert_eq!(Socksaddr::from(destination), source);
-            replies.push(reply.into_vec());
+            let (n, source) =
+                tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buffer)).await.unwrap().unwrap();
+            packets.push(buffer[..n].to_vec());
+            socket.send_to(&vec![0x73; size], source).await.unwrap();
         }
-        let uploads = target.await.unwrap();
-        let _ = proxy.close().await;
-        for ((size, upload), reply) in [4096, 8192].into_iter().zip(uploads).zip(replies) {
-            assert_eq!(size, upload.len(), "mode {mode} UDP upload length");
-            assert_eq!(vec![0x35; size], upload, "mode {mode} UDP upload contents");
-            assert_eq!(size, reply.len(), "mode {mode} UDP download length");
-            assert_eq!(vec![0x73; size], reply, "mode {mode} UDP download contents");
-        }
-        let totals = harness.node.registry.state(1).unwrap().totals();
-        assert_eq!(12288, totals.upload, "mode {mode} UDP upload accounting");
-        assert_eq!(12288, totals.download, "mode {mode} UDP download accounting");
-        harness.shutdown().await;
+        packets
+    });
+    let proxy = harness.client("limited-key-unique-psk").dial_packet_conn(dial(&harness.address).await).unwrap();
+    proxy.set_read_deadline(Some(std::time::Instant::now() + Duration::from_secs(10))).unwrap();
+    let mut replies = Vec::new();
+    for size in [4096, 8192] {
+        let payload = vec![0x35; size];
+        let packet = Buffer::from_slice_with_headroom(&payload, proxy.front_headroom(), proxy.rear_headroom());
+        proxy.write_packet(packet, destination.into()).await.unwrap();
+        let mut reply = Buffer::new_packet();
+        let source = proxy.read_packet(&mut reply).await.unwrap();
+        assert_eq!(size, reply.len(), "UDP download length");
+        assert_eq!(Socksaddr::from(destination), source);
+        replies.push(reply.into_vec());
     }
+    let uploads = target.await.unwrap();
+    let _ = proxy.close().await;
+    for ((size, upload), reply) in [4096, 8192].into_iter().zip(uploads).zip(replies) {
+        assert_eq!(size, upload.len(), "UDP upload length");
+        assert_eq!(vec![0x35; size], upload, "UDP upload contents");
+        assert_eq!(size, reply.len(), "UDP download length");
+        assert_eq!(vec![0x73; size], reply, "UDP download contents");
+    }
+    let totals = harness.node.registry.state(1).unwrap().totals();
+    assert_eq!(12288, totals.upload, "UDP upload accounting");
+    assert_eq!(12288, totals.download, "UDP download accounting");
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -475,7 +468,7 @@ async fn managed_nodes_keep_tcp_udp_egress_and_state_on_their_own_ips() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forged_client_id_cannot_change_the_billed_user() {
-    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk"), spec(2, "bob-key-unique-psk")]).await;
     let client = Client::new(ClientOptions {
         psk: b"alice-key-unique-psk".to_vec(),
         user_key: b"bob-key-unique-psk".to_vec(),
@@ -503,7 +496,7 @@ async fn forged_client_id_cannot_change_the_billed_user() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn psk_rotation_and_empty_snapshot_revoke_access_without_rebinding() {
-    let harness = Harness::start("default", vec![spec(1, "alice-key-unique-psk")]).await;
+    let harness = Harness::start(vec![spec(1, "alice-key-unique-psk")]).await;
     let old_client = harness.client("alice-key-unique-psk");
     round_trip(&old_client, &harness.address, b"before").await.unwrap();
     let server = harness.node.server.read().await.clone().unwrap();

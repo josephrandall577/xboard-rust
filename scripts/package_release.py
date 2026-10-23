@@ -45,6 +45,8 @@ def main():
             ("snell/LICENSE", "LICENSE"),
             ("snell/UPSTREAM.md", "snell/UPSTREAM.md"),
             ("docs/multi-psk-validation.md", "docs/multi-psk-validation.md"),
+            ("docs/upgrading.md", "docs/upgrading.md"),
+            ("docs/xboard-v2-update-guide.md", "docs/xboard-v2-update-guide.md"),
         ]:
             (staging / destination).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / source, staging / destination)

@@ -40,6 +40,10 @@ token = "replace-with-node-b-admin-token"
 disabled = false
 
 [limits]
+# Applied independently to each node, not shared across the process.
+max_handshakes = 256
+max_handshakes_per_ip = 32  # 0 disables this limit; consider shared NATs
+handshake_timeout = 10     # seconds from admission until first AEAD verification
 device_ttl = 300
 enforce_quota = true
 quota_grace = 0

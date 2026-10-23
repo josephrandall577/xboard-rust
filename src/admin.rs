@@ -41,8 +41,11 @@ pub async fn serve(listen: &str, state: AdminState) -> std::io::Result<()> {
 }
 
 pub async fn serve_listener(listener: tokio::net::TcpListener, state: AdminState) -> std::io::Result<()> {
-    let router = router(state);
     let local = listener.local_addr()?;
+    if !local.ip().to_canonical().is_loopback() && state.token.trim().is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "external admin listener requires a token"));
+    }
+    let router = router(state);
     info!(%local, "admin api listening");
     axum::serve(listener, router).await
 }
@@ -142,7 +145,7 @@ struct Stats {
 }
 
 async fn stats(State(state): State<AdminState>) -> Response {
-    let users = match state.store.list_users() {
+    let users = match state.registry.snapshot_usage(|| state.store.list_users()) {
         Ok(users) => users,
         Err(err) => return store_error(err),
     };
@@ -153,9 +156,8 @@ async fn stats(State(state): State<AdminState>) -> Response {
     let mut online = HashMap::new();
     let mut active_users = 0usize;
     for user in &users {
-        let pending = state.registry.state(user.id).map(|s| s.totals()).unwrap_or_default();
-        upload = upload.saturating_add(user.upload).saturating_add(pending.upload);
-        download = download.saturating_add(user.download).saturating_add(pending.download);
+        upload = upload.saturating_add(user.upload);
+        download = download.saturating_add(user.download);
         if let Some(state) = state.registry.state(user.id) {
             let devices = state.device_count(ttl, now);
             if devices > 0 {
@@ -182,7 +184,7 @@ async fn stats(State(state): State<AdminState>) -> Response {
 }
 
 async fn list_users(State(state): State<AdminState>) -> Response {
-    match state.store.list_users() {
+    match state.registry.snapshot_usage(|| state.store.list_users()) {
         Ok(users) => {
             let views: Vec<UserView> = users.into_iter().map(|user| user_view(&state, user)).collect();
             Json(views).into_response()
@@ -192,9 +194,9 @@ async fn list_users(State(state): State<AdminState>) -> Response {
 }
 
 async fn get_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
-    match state.store.get_user(id) {
-        Ok(Some(user)) => Json(user_view(&state, user)).into_response(),
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "user not found"),
+    match state.registry.snapshot_usage(|| state.store.get_user(id).map(|user| user.into_iter().collect())) {
+        Ok(mut users) if !users.is_empty() => Json(user_view(&state, users.remove(0))).into_response(),
+        Ok(_) => error_response(StatusCode::NOT_FOUND, "user not found"),
         Err(err) => store_error(err),
     }
 }
@@ -202,6 +204,41 @@ async fn get_user(State(state): State<AdminState>, Path(id): Path<i64>) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queries_count_persisted_and_pending_bytes_once() {
+        let store = Store::open_memory().unwrap();
+        let spec = UserSpec {
+            id: 1,
+            uuid: "query-test-user".into(),
+            speed_limit: 0,
+            device_limit: 0,
+            transfer_enable: 130,
+            expired_at: 0,
+            enabled: true,
+        };
+        store.replace_users(&[spec]).unwrap();
+        let registry = Arc::new(Registry::new(std::time::Duration::from_secs(60)));
+        registry.apply_users(&store.list_users().unwrap());
+        let relay = registry.state(1).unwrap();
+        relay.record_upload(100);
+        registry.persist_pending(|d| store.stage_traffic(d)).unwrap();
+        relay.record_download(40);
+        let state =
+            AdminState { store, registry, counters: Arc::new(Counters::default()), token: Arc::new(String::new()) };
+        let response = stats(State(state.clone())).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(100, stats["upload"]);
+        assert_eq!(40, stats["download"]);
+        assert_eq!(0, stats["active_users"]);
+        let response = get_user(State(state), Path(1)).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let user: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(140, user["used"]);
+        assert_eq!(0, user["remaining"]);
+        assert_eq!(false, user["active"]);
+    }
 
     #[test]
     fn constant_time_eq_behaviour() {

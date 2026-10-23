@@ -272,6 +272,19 @@ impl Registry {
     /// are preserved, and so are the states of users whose keys changed.
     pub fn apply_users(&self, users: &[User]) {
         let mut inner = self.inner.lock().unwrap();
+        Self::apply_users_locked(&mut inner, users);
+    }
+
+    /// Load and apply persisted counters without allowing a concurrent flush
+    /// to make the loaded snapshot stale before it reaches the registry.
+    pub(crate) fn synchronize_users<E>(&self, load: impl FnOnce() -> Result<Vec<User>, E>) -> Result<(), E> {
+        let mut inner = self.inner.lock().unwrap();
+        let users = load()?;
+        Self::apply_users_locked(&mut inner, &users);
+        Ok(())
+    }
+
+    fn apply_users_locked(inner: &mut RegistryInner, users: &[User]) {
         let mut keys = HashMap::with_capacity(users.len());
         let mut specs = HashMap::with_capacity(users.len());
         for user in users {
@@ -280,8 +293,8 @@ impl Registry {
             let state = inner.users.entry(user.id).or_insert_with(|| Arc::new(UserState::new(user.id))).clone();
             state.set_speed_limit(user.speed_limit);
         }
-        let ids: HashSet<i64> = specs.keys().copied().collect();
-        inner.users.retain(|id, _| ids.contains(id));
+        // Retired relays still hold these states and may produce more bytes.
+        // Reclaim them only after a successful final flush (persist_pending).
         inner.keys = keys;
         inner.specs = specs;
     }
@@ -387,7 +400,29 @@ impl Registry {
                 user.download = user.download.saturating_add(delta.download);
             }
         }
+        let active: HashSet<_> = inner.specs.keys().copied().collect();
+        inner.users.retain(|id, state| {
+            active.contains(id)
+                || Arc::strong_count(state) > 1
+                || state.online_connections() > 0
+                || !state.pending_totals().is_zero()
+        });
         Ok(())
+    }
+
+    /// Reads persisted usage and adds only unflushed bytes while excluding
+    /// concurrent drains, so API totals cannot miss or double-count a flush.
+    pub(crate) fn snapshot_usage<E>(&self, load: impl FnOnce() -> Result<Vec<User>, E>) -> Result<Vec<User>, E> {
+        let inner = self.inner.lock().unwrap();
+        let mut users = load()?;
+        for user in &mut users {
+            if let Some(state) = inner.users.get(&user.id) {
+                let pending = state.pending_totals();
+                user.upload = user.upload.saturating_add(pending.upload);
+                user.download = user.download.saturating_add(pending.download);
+            }
+        }
+        Ok(users)
     }
 
     /// Bytes used by a user, including deltas not yet flushed to the store.
@@ -449,6 +484,27 @@ mod tests {
             upload: 0,
             download: 0,
         }
+    }
+
+    #[test]
+    fn retired_relays_keep_accounting_until_the_final_flush() {
+        let registry = Registry::new(Duration::from_secs(60));
+        let store = crate::store::Store::open_memory().unwrap();
+        registry.apply_users(&[user(1, "u1", 0, 0)]);
+        let relay = registry.state(1).unwrap();
+        assert!(registry.open_connection(1, "1.1.1.1"));
+        relay.record_upload(10);
+        registry.apply_users(&[]);
+        assert!(registry.user_by_key(b"u1").is_none());
+        assert!(!registry.open_connection(1, "2.2.2.2"));
+        registry.persist_pending(|d| store.stage_traffic(d)).unwrap();
+        relay.record_download(20);
+        registry.close_connection(1, "1.1.1.1");
+        assert_eq!(0, relay.online_connections());
+        drop(relay);
+        registry.persist_pending(|d| store.stage_traffic(d)).unwrap();
+        assert_eq!(vec![(1, Traffic { upload: 10, download: 20 })], store.pending_traffic().unwrap());
+        assert!(registry.state(1).is_none(), "retired state should be reclaimed after its final flush");
     }
 
     #[test]

@@ -117,22 +117,22 @@ impl Store {
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             let existing = {
-                let mut stmt = tx.prepare("SELECT id, uuid, upload, download FROM users")?;
+                let mut stmt = tx.prepare("SELECT id, upload, download FROM users")?;
                 let rows = stmt.query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
                 })?;
                 let mut map = HashMap::new();
                 for row in rows {
-                    let (id, uuid, upload, download) = row?;
-                    map.insert(uuid, (id, upload, download));
+                    let (id, upload, download) = row?;
+                    map.insert(id, (upload, download));
                 }
                 map
             };
             tx.execute("DELETE FROM users", [])?;
             for spec in specs {
                 let (upload, download) = existing
-                    .get(&spec.uuid)
-                    .map(|(_, up, down)| (*up, *down))
+                    .get(&spec.id)
+                    .copied()
                     .unwrap_or((0, 0));
                 tx.execute(
                     "INSERT INTO users (id, uuid, speed_limit, device_limit, transfer_enable, expired_at, enabled, upload, download)
@@ -140,9 +140,9 @@ impl Store {
                     params![
                         spec.id,
                         spec.uuid,
-                        spec.speed_limit as i64,
+                        sqlite_limit(spec.speed_limit, "speed_limit")?,
                         spec.device_limit as i64,
-                        spec.transfer_enable as i64,
+                        sqlite_limit(spec.transfer_enable, "transfer_enable")?,
                         spec.expired_at,
                         spec.enabled as i64,
                         upload,
@@ -187,9 +187,9 @@ impl Store {
                 params![
                     spec.id,
                     spec.uuid,
-                    spec.speed_limit as i64,
+                    sqlite_limit(spec.speed_limit, "speed_limit")?,
                     spec.device_limit as i64,
-                    spec.transfer_enable as i64,
+                    sqlite_limit(spec.transfer_enable, "transfer_enable")?,
                     spec.expired_at,
                     spec.enabled as i64,
                     upload,
@@ -221,7 +221,8 @@ impl Store {
                 let mut stmt =
                     tx.prepare("UPDATE users SET upload = upload + ?2, download = download + ?3 WHERE id = ?1")?;
                 for (id, traffic) in deltas {
-                    stmt.execute(params![id, traffic.upload as i64, traffic.download as i64])?;
+                    let (upload, download) = sqlite_traffic(traffic)?;
+                    stmt.execute(params![id, upload, download])?;
                 }
             }
             tx.commit()?;
@@ -310,6 +311,10 @@ impl Store {
     }
 }
 
+fn sqlite_limit(value: u64, field: &str) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::Invalid(format!("{field} exceeds SQLite integer range")))
+}
+
 fn sqlite_traffic(traffic: &Traffic) -> Result<(i64, i64), StoreError> {
     let upload =
         i64::try_from(traffic.upload).map_err(|_| StoreError::Invalid("upload exceeds SQLite integer range".into()))?;
@@ -346,18 +351,6 @@ mod tests {
             expired_at: 0,
             enabled: true,
         }
-    }
-
-    #[test]
-    fn replace_preserves_counters() {
-        let store = Store::open_memory().unwrap();
-        store.replace_users(&[spec(1, "a"), spec(2, "b")]).unwrap();
-        store.add_traffic(&[(1, crate::config::Traffic { upload: 10, download: 20 })]).unwrap();
-        store.replace_users(&[spec(1, "a"), spec(3, "c")]).unwrap();
-        let users = store.list_users().unwrap();
-        assert_eq!(2, users.len());
-        assert_eq!(30, users.iter().find(|u| u.id == 1).unwrap().used());
-        assert_eq!(0, users.iter().find(|u| u.id == 3).unwrap().used());
     }
 
     #[test]

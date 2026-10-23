@@ -7,8 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
-use axum::http::{HeaderMap, Uri};
-use axum::response::IntoResponse;
+use axum::http::Uri;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -31,7 +30,12 @@ impl Recorded {
     }
 }
 
-async fn mock_panel(recorded: Recorded) -> Router {
+async fn record_post(State(r): State<Recorded>, uri: Uri, Json(body): Json<Value>) -> Json<Value> {
+    r.push("POST", &uri, &body);
+    Json(json!({"data": true}))
+}
+
+fn mock_panel(recorded: Recorded) -> Router {
     Router::new()
         .route(
             "/api/v2/server/handshake",
@@ -62,39 +66,23 @@ async fn mock_panel(recorded: Recorded) -> Router {
                 ]}))
             }),
         )
-        .route(
-            "/api/v2/server/report",
-            post(|State(r): State<Recorded>, uri: Uri, Json(body): Json<Value>| async move {
-                r.push("POST", &uri, &body);
-                Json(json!({"data": true}))
-            }),
-        )
-        .route(
-            "/api/v1/server/UniProxy/push",
-            post(|State(r): State<Recorded>, uri: Uri, Json(body): Json<Value>| async move {
-                r.push("POST", &uri, &body);
-                Json(json!({"data": true}))
-            }),
-        )
-        .route(
-            "/api/v1/server/UniProxy/status",
-            post(|State(r): State<Recorded>, uri: Uri, Json(body): Json<Value>| async move {
-                r.push("POST", &uri, &body);
-                Json(json!({"data": true, "code": 0, "message": "success"}))
-            }),
-        )
+        .route("/api/v2/server/report", post(record_post))
+        .route("/api/v1/server/UniProxy/push", post(record_post))
+        .route("/api/v1/server/UniProxy/status", post(record_post))
         .with_state(recorded)
+}
+
+async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, task)
 }
 
 async fn start_mock() -> (Recorded, String) {
     let recorded = Recorded::default();
-    let router: Router = mock_panel(recorded.clone()).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    (recorded, format!("http://{address}"))
+    let (url, _) = serve(mock_panel(recorded.clone())).await;
+    (recorded, url)
 }
 
 fn client(url: String, api_version: u8) -> PanelClient {
@@ -196,7 +184,7 @@ async fn v1_traffic_and_status_match_panel_contract() {
 #[tokio::test]
 async fn machine_mode_uses_machine_auth() {
     let (recorded, url) = start_mock().await;
-    let mut config = PanelConfig {
+    let config = PanelConfig {
         url,
         token: "machine-token".into(),
         node_id: 0,
@@ -206,7 +194,6 @@ async fn machine_mode_uses_machine_auth() {
         ws_url: None,
         machine_id: Some(9),
     };
-    config.node_id = 0;
     let client = PanelClient::new(config).unwrap();
     // Only the request shape matters here; the mock returns users for /user.
     let _ = client.fetch_users().await;
@@ -214,12 +201,6 @@ async fn machine_mode_uses_machine_auth() {
     assert!(requests[0].1.contains("machine_id=9"), "query {}", requests[0].1);
     assert!(!requests[0].1.contains("node_id"), "machine mode must not send node_id");
 }
-
-#[allow(dead_code)]
-fn _headers(_: HeaderMap) {}
-
-#[allow(dead_code)]
-fn _json(_: impl IntoResponse) {}
 
 #[tokio::test]
 async fn missing_user_snapshot_is_an_error_but_explicit_empty_revokes_users() {
@@ -232,11 +213,7 @@ async fn missing_user_snapshot_is_an_error_but_explicit_empty_revokes_users() {
                 async move { Json(body) }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
+        let (url, task) = serve(router).await;
         let result = client(url, 2).fetch_users().await;
         if expected_empty {
             assert!(result.unwrap().is_empty());
@@ -245,4 +222,23 @@ async fn missing_user_snapshot_is_an_error_but_explicit_empty_revokes_users() {
         }
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn unicode_error_bodies_do_not_panic_or_disable_subsequent_requests() {
+    let router = Router::new()
+        .route("/api/v2/server/user", get(|| async { (axum::http::StatusCode::BAD_GATEWAY, "界".repeat(2000)) }));
+    let (url, task) = serve(router).await;
+    let panel = client(url, 2);
+    for _ in 0..2 {
+        match panel.fetch_users().await.unwrap_err() {
+            xboard_snell::panel::PanelError::Status { status, body } => {
+                assert_eq!(502, status);
+                assert!(body.ends_with('…'));
+                assert!(body.len() <= 4099);
+            }
+            err => panic!("unexpected error: {err}"),
+        }
+    }
+    task.abort();
 }
